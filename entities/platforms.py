@@ -10,7 +10,17 @@ import random
 
 import pygame
 
-from config.constants import SCREEN_WIDTH
+from config.constants import (
+    PLATFORM_MOVE_SPEED,
+    PLATFORM_SIZE,
+    RED_PLATFORM_TIMER_MAX,
+    RED_PLATFORM_TIMER_MIN,
+    SCREEN_WIDTH,
+)
+
+NORMAL_COLOR = (200, 200, 200)
+MOVING_COLOR = (100, 100, 255)
+FRAGILE_COLOR = (255, 80, 80)
 
 
 class Platform(pygame.sprite.Sprite):
@@ -18,8 +28,8 @@ class Platform(pygame.sprite.Sprite):
 
     def __init__(self, x: int, y: int) -> None:
         super().__init__()
-        self.image: pygame.Surface = pygame.Surface((100, 20))
-        self.image.fill((200, 200, 200))
+        self.image: pygame.Surface = pygame.Surface(PLATFORM_SIZE)
+        self.image.fill(NORMAL_COLOR)
         self.rect: pygame.Rect = self.image.get_rect(center=(x, y))
 
 
@@ -28,8 +38,8 @@ class BluePlatform(Platform):
 
     def __init__(self, x: int, y: int) -> None:
         super().__init__(x, y)
-        self.image.fill((100, 100, 255))
-        self.speed: int = 2
+        self.image.fill(MOVING_COLOR)
+        self.speed: int = PLATFORM_MOVE_SPEED
         self.direction: int = 1
 
     def update(self) -> None:
@@ -44,8 +54,10 @@ class RedPlatform(Platform):
 
     def __init__(self, x: int, y: int) -> None:
         super().__init__(x, y)
-        self.image.fill((255, 80, 80))
-        self.timer: int = random.randint(30, 90)
+        self.image.fill(FRAGILE_COLOR)
+        self.timer: int = random.randint(
+            RED_PLATFORM_TIMER_MIN, RED_PLATFORM_TIMER_MAX
+        )
         self.timer_started: bool = False
 
     def update(self) -> None:
