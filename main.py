@@ -4,17 +4,15 @@ Run this file to start the game::
 
     python main.py
 """
-import pygame
+
+from __future__ import annotations
 
 from core.game import Game
 
 
 def main() -> None:
-    """Initialize Pygame and start the game loop."""
-    pygame.init()
-    game = Game()
-    while True:
-        game.show_menu()
+    """Create the game and run it until the player quits."""
+    Game().run()
 
 
 if __name__ == "__main__":
