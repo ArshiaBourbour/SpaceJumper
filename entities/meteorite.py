@@ -7,31 +7,40 @@ from typing import TYPE_CHECKING
 
 import pygame
 
-from config.constants import SCREEN_WIDTH, SCREEN_HEIGHT, METEORITE_IMG_PATH
+from config.constants import (
+    METEORITE_FALL_SPEED,
+    METEORITE_IMG_PATH,
+    METEORITE_SIZE,
+    SCREEN_HEIGHT,
+    SCREEN_WIDTH,
+)
 
-if TYPE_CHECKING:
-    from core.game import Game
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
+    from core.world import World
+
+_SPAWN_TOP = -500
+_SPAWN_BOTTOM = -50
+_SIZE = METEORITE_SIZE[0]
 
 
 class Meteorite(pygame.sprite.Sprite):
     """A falling hazard that kills the player on contact."""
 
-    def __init__(self, game: Game) -> None:
+    def __init__(self, world: World) -> None:
         super().__init__()
-        self.game = game
-        self.image: pygame.Surface = pygame.image.load(
-            METEORITE_IMG_PATH
-        ).convert_alpha()
-        self.image = pygame.transform.scale(self.image, (40, 40))
+        # Sprites share the cached surface, so they must never draw onto it.
+        self.image: pygame.Surface = world.resources.load_image(
+            METEORITE_IMG_PATH, METEORITE_SIZE
+        )
         self.rect: pygame.Rect = self.image.get_rect()
-        self.rect.x = random.randint(0, SCREEN_WIDTH - 40)
-        self.rect.y = random.randint(-500, -50)
-        self.speed: int = 4
+        self.rect.x = random.randint(0, SCREEN_WIDTH - _SIZE)
+        self.rect.y = random.randint(_SPAWN_TOP, _SPAWN_BOTTOM)
+        self.speed: int = METEORITE_FALL_SPEED
 
     def update(self) -> None:
         """Move the meteorite downward and respawn it above the screen
         when it falls off the bottom."""
         self.rect.y += self.speed
         if self.rect.top > SCREEN_HEIGHT:
-            self.rect.x = random.randint(0, SCREEN_WIDTH - 40)
-            self.rect.y = random.randint(-500, -50)
+            self.rect.x = random.randint(0, SCREEN_WIDTH - _SIZE)
+            self.rect.y = random.randint(_SPAWN_TOP, _SPAWN_BOTTOM)
