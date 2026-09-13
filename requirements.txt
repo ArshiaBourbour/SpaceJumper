@@ -1,0 +1,6 @@
+# Space Jumper runtime dependencies.
+#
+# Python 3.11 - 3.13 is recommended. Some pygame wheels published for
+# Python 3.14 ship without the `font` and `mixer` extensions, which the game
+# needs for its UI and sound.
+pygame>=2.5.0,<3.0
