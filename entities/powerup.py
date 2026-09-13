@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import pygame
 
+from config.constants import POWERUP_SIZE
+
 
 class PowerUp(pygame.sprite.Sprite):
     """A collectible power-up that grants a temporary ability."""
@@ -23,6 +25,6 @@ class PowerUp(pygame.sprite.Sprite):
     def __init__(self, x: int, y: int, kind: str) -> None:
         super().__init__()
         self.kind: str = kind
-        self.image: pygame.Surface = pygame.Surface((25, 25))
+        self.image: pygame.Surface = pygame.Surface(POWERUP_SIZE)
         self.image.fill(self.POWERUP_COLORS.get(kind, (255, 255, 255)))
         self.rect: pygame.Rect = self.image.get_rect(center=(x, y))
