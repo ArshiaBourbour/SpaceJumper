@@ -1,5 +1,5 @@
 json
-
+save/*.json
 
 __pycache__/
 *.pyc
@@ -11,5 +11,8 @@ reports/
 
 venv/
 .env
+
+# Editor / tooling state
+.freebuff/
 
 .DS_Store
