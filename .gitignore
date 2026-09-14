@@ -1,6 +1,7 @@
 json
 save/*.json
-
+__pycache__/
+o
 __pycache__/
 *.pyc
 *.pyo
