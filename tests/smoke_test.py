@@ -1,11 +1,14 @@
-"""Headless regression suite for Space Jumper (Phase 2).
+"""Headless regression suite for Space Jumper (Phases 2 and 3).
 
 Run it with a dummy SDL driver so no window or speakers are needed::
 
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python tests/smoke_test.py
 
 It checks the systems Phase 2 introduced (states, resources, audio, saves,
-input, configuration) and that the existing gameplay still behaves.
+input, configuration) and the gameplay guarantees Phase 3 established: frame
+rate independence, reliable collision, reachable platform generation, camera
+and world coordinates staying apart, and recycling of what the camera leaves
+behind.
 """
 
 from __future__ import annotations
@@ -21,16 +24,40 @@ import pygame
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from config.constants import (  # noqa: E402
+    FUEL_MAX,
+    JUMP_VELOCITY,
+    MAX_FALL_SPEED,
+    MIN_FUEL_CANISTERS,
+    PLATFORM_CULL_MARGIN,
+    PLATFORM_MOVE_SPEED,
+    PLATFORM_SPAWN_GAP_MAX,
+    PLATFORM_SPAWN_GAP_MIN,
+    SCREEN_HEIGHT,
+    SCREEN_WIDTH,
+)
 from config.settings import Settings  # noqa: E402
 from core.game import Game  # noqa: E402
 from core.game_state import GameState  # noqa: E402
+from core.world import World  # noqa: E402
 from entities import Fuel, Player  # noqa: E402
+from entities.platforms import BluePlatform, Platform, RedPlatform  # noqa: E402
 from managers.resource_manager import ResourceManager  # noqa: E402
 from managers.save_manager import SaveManager  # noqa: E402
 from states.playing import PlayingState  # noqa: E402
 from systems.input import InputManager  # noqa: E402
+from systems.physics import apex_height, platform_reachable  # noqa: E402
+from utils.platform_factory import generate_reachable_platform  # noqa: E402
 
 FRAME = 1.0 / 60.0
+
+#: Frame times the game has to behave the same at.
+FRAME_RATES: dict[str, float] = {
+    "30 FPS": 1.0 / 30.0,
+    "60 FPS": 1.0 / 60.0,
+    "120 FPS": 1.0 / 120.0,
+    "144 FPS": 1.0 / 144.0,
+}
 
 _failures: list[str] = []
 _checks = 0
@@ -414,10 +441,11 @@ def test_gameplay() -> None:
     pygame.event.post(pygame.event.Event(pygame.KEYUP, key=pygame.K_a))
 
     # Drop the player onto a platform to test landing and jumping.
-    platform = max(world.platforms, key=lambda item: item.rect.y)
-    world.player.rect.centerx = platform.rect.centerx
-    world.player.rect.bottom = platform.rect.top - 5
-    world.player.velocity_y = 1.0
+    platform = max(world.platforms, key=lambda item: item.rect.centery)
+    world.player.teleport(
+        float(platform.rect.centerx),
+        float(platform.rect.top - world.player.rect.height - 5),
+    )
     harness.step(10)
     check(world.player.on_ground, "the player lands on a platform")
     check(
@@ -442,15 +470,17 @@ def test_gameplay() -> None:
     check(world.score == score_before + 10, "collecting fuel scores 10 points")
 
     # Climb repeatedly until the camera scrolls and the world extends.
-    world.player.rect.y = 100
+    highest_before = min(item.rect.centery for item in world.platforms)
+    world.player.teleport(world.player.position_x, world.camera.to_world_y(100.0))
     harness.step()
     check(world.camera_y > 0, "the camera scrolls once the player climbs")
-    platforms_before = len(world.platforms)
     for _ in range(25):
-        world.player.rect.y = 100
+        world.player.teleport(
+            world.player.position_x, world.player.position_y - 100.0
+        )
         harness.step()
     check(
-        len(world.platforms) > platforms_before,
+        min(item.rect.centery for item in world.platforms) < highest_before,
         "new platforms are generated above the view",
     )
     harness.close()
@@ -584,20 +614,554 @@ def test_player_unit() -> None:
     state = harness.start_round()
     world = state.world
     assert world is not None
-    check(isinstance(world.player, Player), "the world owns a player")
-    check(world.player.speed_x == 5, "player speed matches the phase 1 value")
-    check(world.player.velocity_y >= 0, "gravity pulls the player down")
+    player = world.player
+    check(isinstance(player, Player), "the world owns a player")
+    check(player.speed_x == 300.0, "player speed is 300 px/s")
+    check(player.velocity_y >= 0, "gravity pulls the player down")
 
+    player.on_ground = False
     world.double_jump_available = True
-    world.player.on_ground = False
-    world.player.jump()
-    check(world.player.velocity_y == -15.0, "a mid-air jump uses the double jump")
+    player.jump()
+    check(player.velocity_y == -900.0, "a mid-air jump launches at 900 px/s")
+    check(not world.double_jump_available, "the mid-air jump is consumed")
+
     world.super_jump_active = True
-    world.player.on_ground = True
-    world.player.jump()
-    check(world.player.velocity_y == -20.0, "the super jump is stronger")
+    world.double_jump_available = True
+    player.on_ground = True
+    player.jump()
+    check(player.velocity_y == -1200.0, "the super jump is stronger")
     check(not world.super_jump_active, "the super jump is consumed")
+    check(
+        world.double_jump_available,
+        "a jump from the ground keeps the mid-air jump",
+    )
+
+    world.super_jump_active = True
+    world.double_jump_available = False
+    player.on_ground = False
+    player.velocity_y = 500.0
+    player.jump()
+    check(
+        player.velocity_y == 500.0,
+        "an unavailable mid-air jump changes nothing",
+    )
+    check(world.super_jump_active, "a wasted jump press keeps the super jump buff")
     harness.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 - frame-rate independence, collision and reachability
+# ---------------------------------------------------------------------------
+
+
+def _isolated_setup(
+    *, y: float = SCREEN_HEIGHT, seed: int = 3
+) -> tuple[Harness, World, Platform]:
+    """Start a round reduced to a single clean platform at height *y*.
+
+    The player is driven directly through :meth:`Player.update` afterwards, so
+    platform generation, fuel and hazards cannot interfere with a measurement.
+    """
+    random.seed(seed)
+    harness = Harness()
+    state = harness.start_round("lab")
+    world = state.world
+    assert world is not None
+    platform = Platform(SCREEN_WIDTH / 2, y)
+    world.platforms.empty()
+    world.platforms.add(platform)
+    world.fuels.empty()
+    world.meteorites.empty()
+    world.powerups.empty()
+    return harness, world, platform
+
+
+def _jump_arc(dt: float, *, move: bool = False) -> dict[str, float]:
+    """Drive one jump at *dt* and measure the arc.
+
+    Returns:
+        ``apex`` (px climbed), ``rise`` (seconds to the top), ``duration``
+        (seconds until landing), ``dx`` (px travelled while holding right) and
+        ``grounded`` (whether the launch platform held the player).
+    """
+    harness, world, platform = _isolated_setup()
+    try:
+        player = world.player
+        player.teleport(
+            platform.rect.centerx - player.rect.width / 2,
+            float(platform.rect.top - player.rect.height),
+        )
+        inputs = InputManager()
+        player.update(dt, inputs)
+        grounded = player.on_ground
+        if move:
+            inputs.begin_frame(
+                [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, unicode="")]
+            )
+
+        start_x, start_y = player.position_x, player.position_y
+        player.jump()
+        apex, rise, elapsed = start_y, 0.0, 0.0
+        while elapsed < 3.0:
+            player.update(dt, inputs)
+            elapsed += dt
+            apex = min(apex, player.position_y)
+            if rise == 0.0 and player.velocity_y >= 0:
+                rise = elapsed
+            # The arc is over once the player is back at the launch height on
+            # the way down, whether it caught the platform again or not.
+            if player.on_ground or (
+                player.velocity_y > 0 and player.position_y >= start_y
+            ):
+                break
+        return {
+            "apex": start_y - apex,
+            "rise": rise,
+            "duration": elapsed,
+            "dx": player.position_x - start_x,
+            "grounded": grounded,
+        }
+    finally:
+        harness.close()
+
+
+def test_frame_rate_independence() -> None:
+    section("Frame-rate independence")
+    for label, dt in FRAME_RATES.items():
+        result = _jump_arc(dt)
+        check(result["grounded"], f"{label}: the jump starts from the ground")
+        check(
+            abs(result["apex"] - apex_height()) <= 0.5,
+            f"{label}: a jump rises {apex_height():.0f} px (got {result['apex']:.1f})",
+        )
+        check(
+            abs(result["rise"] - 0.5) <= dt,
+            f"{label}: the apex is reached in 0.5 s (got {result['rise']:.3f})",
+        )
+        check(
+            abs(result["duration"] - 1.0) <= 1.5 * dt,
+            f"{label}: the jump lasts 1 s (got {result['duration']:.3f})",
+        )
+
+    for label, dt in FRAME_RATES.items():
+        result = _jump_arc(dt, move=True)
+        check(
+            abs(result["dx"] - 300.0) <= 300.0 * dt + 1.0,
+            f"{label}: holding right covers 300 px per jump (got {result['dx']:.1f})",
+        )
+
+
+def test_fast_fall_collision() -> None:
+    section("Collision: fast falls")
+    for label, dt in FRAME_RATES.items():
+        harness, world, platform = _isolated_setup(y=SCREEN_HEIGHT - 200)
+        try:
+            player = world.player
+            player.teleport(
+                float(platform.rect.centerx),
+                float(platform.rect.top - player.rect.height - 2),
+            )
+            player.velocity_y = MAX_FALL_SPEED
+            fall_per_frame = MAX_FALL_SPEED * dt
+            player.update(dt, InputManager())
+            check(
+                player.on_ground and player.rect.bottom == platform.rect.top,
+                f"{label}: a {fall_per_frame:.0f} px-per-frame fall lands, not tunnels",
+            )
+        finally:
+            harness.close()
+
+
+def test_one_way_platforms() -> None:
+    section("Collision: one-way platforms")
+    harness, world, platform = _isolated_setup(y=SCREEN_HEIGHT - 200)
+    try:
+        player = world.player
+        player.teleport(
+            float(platform.rect.centerx), float(platform.rect.bottom + 4)
+        )
+        player.velocity_y = JUMP_VELOCITY
+        inputs = InputManager()
+
+        landed_while_rising = False
+        for _ in range(20):
+            player.update(FRAME, inputs)
+            if player.on_ground:
+                landed_while_rising = True
+                break
+        check(not landed_while_rising, "a rising player passes through a platform")
+        check(player.velocity_y < 0, "the pass-through did not stop the jump")
+
+        for _ in range(240):
+            player.update(FRAME, inputs)
+            if player.on_ground:
+                break
+        check(player.on_ground, "the falling player lands on the way back down")
+        check(
+            any(
+                player.rect.bottom == item.rect.top
+                for item in world.platforms
+            ),
+            "the landing rests on a platform's top edge",
+        )
+    finally:
+        harness.close()
+
+
+def test_landing_edges() -> None:
+    section("Collision: platform edges")
+    harness, world, platform = _isolated_setup(y=SCREEN_HEIGHT - 200)
+    try:
+        player = world.player
+        # A foot on the very edge still counts as a landing.
+        player.teleport(
+            float(platform.rect.right - 1 - player.rect.width),
+            float(platform.rect.top - player.rect.height - 2),
+        )
+        player.velocity_y = 300.0
+        player.update(FRAME, InputManager())
+        check(player.on_ground, "a player whose foot reaches the edge lands")
+        check(
+            player.rect.bottom == platform.rect.top,
+            "the edge landing rests on the platform's top",
+        )
+
+        # One pixel further out is a miss, so the player keeps falling.
+        player.teleport(
+            float(platform.rect.right + 1),
+            float(platform.rect.top - player.rect.height - 2),
+        )
+        player.velocity_y = 300.0
+        player.update(FRAME, InputManager())
+        check(not player.on_ground, "a player beside the platform does not land on it")
+    finally:
+        harness.close()
+
+
+def test_time_based_timers() -> None:
+    section("Timers and moving platforms")
+    for label, dt in {"30 FPS": FRAME_RATES["30 FPS"], "120 FPS": FRAME_RATES["120 FPS"]}.items():
+        random.seed(2)
+        fragile = RedPlatform(400, 300)
+        group = pygame.sprite.Group(fragile)
+        expected = fragile.timer
+        fragile.start_timer()
+        elapsed = 0.0
+        while fragile.alive() and elapsed < 5.0:
+            group.update(dt)
+            elapsed += dt
+        check(
+            abs(elapsed - expected) <= dt + 1e-9,
+            f"{label}: a red platform survives {expected:.2f} s (got {elapsed:.3f})",
+        )
+
+    for label, dt in {"30 FPS": FRAME_RATES["30 FPS"], "120 FPS": FRAME_RATES["120 FPS"]}.items():
+        mover = BluePlatform(300, 300)
+        for _ in range(round(1.0 / dt)):
+            mover.update(dt)
+        check(
+            mover.rect.centerx == 300 + round(PLATFORM_MOVE_SPEED),
+            f"{label}: a blue platform travels {PLATFORM_MOVE_SPEED:.0f} px in a second "
+            f"(got {mover.rect.centerx - 300} px)",
+        )
+
+
+def test_platform_reachability() -> None:
+    section("Platform reachability")
+    links = 0
+    blocked: list[float] = []
+    gaps: list[float] = []
+    spans: list[float] = []
+
+    for seed in range(12):
+        random.seed(seed)
+        platforms = pygame.sprite.Group()
+        y = float(SCREEN_HEIGHT)
+        for _ in range(150):
+            platform = generate_reachable_platform(y, platforms)
+            platforms.add(platform)
+            y = platform.rect.centery - random.uniform(
+                PLATFORM_SPAWN_GAP_MIN, PLATFORM_SPAWN_GAP_MAX
+            )
+
+        ladder = sorted(platforms, key=lambda item: item.rect.centery, reverse=True)
+        for lower, upper in zip(ladder, ladder[1:]):
+            links += 1
+            vertical = lower.rect.centery - upper.rect.centery
+            horizontal = abs(lower.rect.centerx - upper.rect.centerx)
+            if not platform_reachable(vertical, horizontal):
+                blocked.append(horizontal)
+            gaps.append(vertical)
+        spans.append(max(item.rect.centerx for item in platforms) - min(item.rect.centerx for item in platforms))
+
+    check(
+        not blocked,
+        f"every platform is one jump from the one below it ({links} links checked, "
+        f"{len(blocked)} blocked)",
+    )
+    check(
+        max(gaps) <= apex_height(),
+        f"no vertical gap exceeds the {apex_height():.0f} px jump ({max(gaps):.1f} px)",
+    )
+    check(
+        min(spans) > 100.0,
+        f"generated platforms still vary horizontally (spread {min(spans):.0f} px)",
+    )
+
+
+def test_end_to_end_across_frame_rates() -> None:
+    section("End-to-end across frame rates")
+    landings: dict[str, tuple[float, float, float]] = {}
+    drain_rates: list[float] = []
+
+    for label, dt in FRAME_RATES.items():
+        random.seed(42)
+        harness = Harness()
+        try:
+            state = harness.start_round("e2e")
+            world = state.world
+            assert world is not None
+            world.meteorites.empty()
+
+            elapsed = 0.0
+            while elapsed < 2.0 and not world.player.on_ground:
+                harness.step(1, dt)
+                elapsed += dt
+            landings[label] = (
+                elapsed,
+                round(world.player.position_x, 2),
+                round(world.player.position_y, 2),
+            )
+
+            fuel_before, time_before = world.fuel_level, world.timer
+            for _ in range(round(5.0 / dt)):
+                harness.step(1, dt)
+            drain_rates.append(
+                (fuel_before - world.fuel_level) / (world.timer - time_before)
+            )
+        finally:
+            harness.close()
+
+    times = [landing[0] for landing in landings.values()]
+    check(
+        max(times) - min(times) <= FRAME_RATES["30 FPS"],
+        "the opening fall takes the same time at every frame rate "
+        f"({', '.join(f'{value:.3f}s' for value in times)})",
+    )
+    check(
+        len({landing[1:] for landing in landings.values()}) == 1,
+        f"the player lands in the same place at every frame rate "
+        f"({landings['60 FPS'][1:]})",
+    )
+    check(
+        max(drain_rates) - min(drain_rates) < 0.01,
+        "fuel drains at the same rate at every frame rate "
+        f"({', '.join(f'{rate:.2f}/s' for rate in drain_rates)})",
+    )
+
+
+def test_fresh_round_is_survivable() -> None:
+    section("Fairness: the opening")
+    seeds = 30
+    variants: tuple[tuple[str, int | None], ...] = (
+        ("no input", None),
+        ("holding right", pygame.K_d),
+        ("holding left", pygame.K_a),
+    )
+    for label, steering in variants:
+        landed = 0
+        deaths = 0
+        for seed in range(seeds):
+            random.seed(seed)
+            harness = Harness()
+            try:
+                state = harness.start_round("idle")
+                world = state.world
+                assert world is not None
+                world.meteorites.empty()  # only the platform layout can kill
+                if steering is not None:
+                    press(steering)
+                for _ in range(90):  # the opening fall takes about half a second
+                    harness.step()
+                    if world.player.on_ground or world.is_over:
+                        break
+                landed += world.player.on_ground
+                deaths += world.is_over
+            finally:
+                harness.close()
+        check(
+            landed == seeds,
+            f"the player lands after the opening fall while {label} "
+            f"({landed}/{seeds})",
+        )
+        check(
+            deaths == 0,
+            f"the opening fall kills no one while {label} ({deaths}/{seeds} died)",
+        )
+
+
+def test_climb_integrity() -> None:
+    section("Climb integrity")
+    random.seed(13)
+    harness = Harness()
+    try:
+        state = harness.start_round("climber")
+        world = state.world
+        assert world is not None
+        player = world.player
+        world.meteorites.empty()
+        seen: set[int] = set()
+        spawns = misplaced = 0
+
+        for _ in range(400):
+            world.fuel_level = FUEL_MAX
+            player.teleport(
+                player.position_x, player.position_y - 60.0
+            )
+            harness.step()
+            view = (world.camera.view_top(), world.camera.view_bottom())
+            for canister in world.fuels:
+                if id(canister) in seen:
+                    continue
+                seen.add(id(canister))
+                spawns += 1
+                misplaced += not (view[0] <= canister.rect.centery <= view[1])
+
+        platforms = list(world.platforms)
+        view_top, view_bottom = world.camera.view_top(), world.camera.view_bottom()
+        check(
+            world.camera_y > 20000.0,
+            f"the climb advanced the camera ({world.camera_y:.0f} px)",
+        )
+        check(
+            len(platforms) <= 60,
+            f"the world stays bounded while climbing ({len(platforms)} platforms)",
+        )
+        check(
+            all(
+                item.rect.top <= view_bottom + PLATFORM_CULL_MARGIN
+                for item in platforms
+            ),
+            "platforms left below the view are recycled",
+        )
+        check(
+            min(item.rect.centery for item in platforms) < view_top,
+            "platforms keep being generated above the view",
+        )
+        check(
+            spawns >= 5 and not misplaced,
+            f"every fuel canister is introduced inside the view "
+            f"({spawns} spawns, {misplaced} misplaced)",
+        )
+        check(
+            len(world.fuels) == MIN_FUEL_CANISTERS,
+            "the world always holds the configured number of canisters",
+        )
+        check(
+            all(
+                canister.rect.top <= view_bottom + PLATFORM_CULL_MARGIN
+                for canister in world.fuels
+            ),
+            "no fuel canister is stranded below the view",
+        )
+        check(
+            all(
+                meteorite.rect.top <= view_bottom
+                for meteorite in world.meteorites
+            ),
+            "meteorites are recycled relative to the view",
+        )
+    finally:
+        harness.close()
+
+
+def test_camera_separates_world_and_screen() -> None:
+    section("Camera and world coordinates")
+    random.seed(3)
+    harness = Harness()
+    try:
+        state = harness.start_round("camera")
+        world = state.world
+        assert world is not None
+        player = world.player
+        still = [item for item in world.platforms if type(item) is Platform][:5]
+        before = {id(item): item.rect.topleft for item in still}
+
+        target = player.position_y - 200.0
+        player.teleport(player.position_x, target)
+        harness.step()
+
+        check(world.camera_y > 0, "the camera scrolled with the climb")
+        check(
+            all(item.rect.topleft == before[id(item)] for item in still),
+            "static platforms keep their world coordinates",
+        )
+        check(
+            abs(player.position_y - target) < 1.0,
+            "the camera did not push the player down the world",
+        )
+        check(
+            world.camera.to_screen_y(player.position_y)
+            == player.position_y + world.camera_y,
+            "screen position is world position plus the camera offset",
+        )
+        check(
+            world.camera.view_top() == -world.camera_y
+            and world.camera.view_bottom() == SCREEN_HEIGHT - world.camera_y,
+            "the visible world band follows the offset",
+        )
+        check(
+            player.rect.y == round(player.position_y),
+            "the rect mirrors the float position",
+        )
+    finally:
+        harness.close()
+
+
+def test_pause_during_jump() -> None:
+    section("Pause during a jump")
+    harness, world, platform = _isolated_setup(y=SCREEN_HEIGHT - 300)
+    try:
+        player = world.player
+        player.teleport(
+            float(platform.rect.centerx),
+            float(platform.rect.top - player.rect.height),
+        )
+        player.on_ground = True
+        player.jump()
+        harness.step(6)
+        check(
+            harness.game.states.current_id is GameState.PLAYING,
+            "the round is still active mid-jump",
+        )
+
+        press(pygame.K_ESCAPE)
+        harness.step()
+        check(
+            harness.game.states.current_id is GameState.PAUSED,
+            "escape pauses the round mid-jump",
+        )
+
+        frozen_y, frozen_velocity = player.position_y, player.velocity_y
+        harness.step(30)
+        check(
+            player.position_y == frozen_y and player.velocity_y == frozen_velocity,
+            "a paused jump hangs frozen in the air",
+        )
+
+        press(pygame.K_ESCAPE)
+        harness.step()
+        check(
+            harness.game.states.current_id is GameState.PLAYING,
+            "escape resumes the round",
+        )
+        harness.step()
+        check(
+            player.position_y != frozen_y or player.velocity_y != frozen_velocity,
+            "the jump continues where it stopped",
+        )
+    finally:
+        harness.close()
 
 
 def main() -> int:
@@ -620,6 +1184,17 @@ def main() -> int:
     test_quit()
     test_username_persistence()
     test_player_unit()
+    test_frame_rate_independence()
+    test_fast_fall_collision()
+    test_one_way_platforms()
+    test_landing_edges()
+    test_time_based_timers()
+    test_platform_reachability()
+    test_end_to_end_across_frame_rates()
+    test_fresh_round_is_survivable()
+    test_climb_integrity()
+    test_camera_separates_world_and_screen()
+    test_pause_during_jump()
 
     print(f"\n{_checks - len(_failures)}/{_checks} checks passed")
     if _failures:
@@ -627,7 +1202,7 @@ def main() -> int:
         for failure in _failures:
             print(f"  - {failure}")
         return 1
-    print("All Phase 2 regression checks passed.")
+    print("All Phase 2 and Phase 3 regression checks passed.")
     return 0
 
 
