@@ -88,24 +88,55 @@ POWERUP_SIZE: tuple[int, int] = (25, 25)
 # ---------------------------------------------------------------------------
 # World / gameplay tuning
 # ---------------------------------------------------------------------------
+# Every speed, acceleration and duration below is expressed per **second**,
+# never per frame, so the simulation behaves the same at 30, 60, 120 and 144
+# FPS.  The numbers are the original per-frame Phase 1 values rescaled for the
+# 60 FPS reference frame the game was designed on (x60 for speeds, x3600 for
+# accelerations), which keeps the feel of the original tuning.
 STAR_COUNT: int = 100
+STAR_DRIFT_MIN: float = 12.0
+STAR_DRIFT_MAX: float = 60.0
+#: How much of the camera scroll a star echoes for a parallax effect.
+STAR_PARALLAX_FACTOR: float = 0.05
+STAR_PARALLAX_MAX: float = 120.0
+
 INITIAL_PLATFORM_COUNT: int = 25
 PLATFORM_VERTICAL_SPACING: int = 100
 PLATFORM_SPAWN_MARGIN: int = 50
-PLATFORM_SPAWN_GAP_MIN: int = 120
-PLATFORM_SPAWN_GAP_MAX: int = 180
-PLATFORM_SPAWN_CEILING: int = -200
+PLATFORM_SPAWN_GAP_MIN: float = 120.0
+PLATFORM_SPAWN_GAP_MAX: float = 180.0
+#: Free space kept between the top of the view and the newest platform.
+PLATFORM_SPAWN_HEADROOM: float = 200.0
+#: Upper bound on platforms generated in a single frame (a frame is never
+#: allowed to stall generating a whole screen of them).
+MAX_PLATFORM_SPAWNS_PER_FRAME: int = 6
+#: Platforms scrolled this far below the view can never be reached again.
+PLATFORM_CULL_MARGIN: float = 150.0
+#: Fraction of the jump apex a vertical gap may claim.
+PLATFORM_GAP_HEADROOM: float = 0.85
+#: Distance shaved off the theoretical jump reach so a generated platform is
+#: never a borderline pixel-perfect input.
+PLATFORM_REACH_SAFETY: float = 40.0
 PLATFORM_WEIGHTS: dict[str, int] = {"normal": 75, "blue": 15, "red": 10}
+#: The player starts in mid-air, so the platform it falls onto is widened into
+#: a pad: a 100 px platform left no room to react, and drifting off it during
+#: the opening fall ended nearly every run before the controls could be learnt.
+START_PLATFORM_SIZE: tuple[int, int] = (PLATFORM_SIZE[0] * 4, PLATFORM_SIZE[1])
 
-PLATFORM_MOVE_SPEED: int = 2
-RED_PLATFORM_TIMER_MIN: int = 30
-RED_PLATFORM_TIMER_MAX: int = 90
+PLATFORM_MOVE_SPEED: float = 120.0
+RED_PLATFORM_TIMER_MIN: float = 0.5
+RED_PLATFORM_TIMER_MAX: float = 1.5
 
 INITIAL_METEORITE_COUNT: int = 2
-METEORITE_FALL_SPEED: int = 4
+METEORITE_FALL_SPEED: float = 240.0
+#: How far above the top of the view a meteorite re-enters the world.
+METEORITE_SPAWN_ABOVE_MIN: float = 50.0
+METEORITE_SPAWN_ABOVE_MAX: float = 500.0
 
 MIN_FUEL_CANISTERS: int = 2
 FUEL_SPAWN_ATTEMPTS: int = 40
+#: Inset from the edges of the view when looking for a fuel spawn position.
+FUEL_SPAWN_MARGIN: float = 40.0
 
 POWERUP_SPAWN_CHANCE: float = 0.1
 POWERUP_SPAWN_OFFSET: int = 30
@@ -116,11 +147,12 @@ FUEL_START: float = 100.0
 FUEL_PICKUP_AMOUNT: float = 30.0
 FUEL_CONSUMPTION_RATE: float = 5.0
 
-GRAVITY: float = 0.5
-JUMP_POWER: float = -15.0
-SUPER_JUMP_POWER: float = -20.0
-PLAYER_SPEED: int = 5
-PLAYER_RESTITUTION_TOLERANCE: int = 15
+GRAVITY: float = 1800.0  # px/s^2, a 225 px apex with the standard jump
+JUMP_VELOCITY: float = -900.0  # px/s, launch speed of a standard jump
+SUPER_JUMP_VELOCITY: float = -1200.0  # px/s, launch speed of a super jump
+PLAYER_SPEED: float = 300.0  # px/s of horizontal movement
+#: Terminal velocity, so a long fall stays inside the world's collision budget.
+MAX_FALL_SPEED: float = 1200.0
 
 JUMP_SCORE: int = 5
 FUEL_SCORE: int = 10
@@ -129,7 +161,8 @@ SLOW_MOTION_FACTOR: float = 0.5
 SLOW_MOTION_DURATION: float = 5.0
 
 ALTITUDE_GOAL: float = 5000.0
-CAMERA_DEAD_ZONE: int = SCREEN_HEIGHT // 3
+#: The player is kept at or above this screen row by the camera.
+CAMERA_DEAD_ZONE: float = SCREEN_HEIGHT / 3
 
 # ---------------------------------------------------------------------------
 # UI
