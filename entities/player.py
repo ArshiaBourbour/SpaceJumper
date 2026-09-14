@@ -1,4 +1,10 @@
-"""Player entity controlled by keyboard input."""
+"""Player entity controlled by keyboard input.
+
+The player keeps its position as a pair of floats in **world coordinates** and
+mirrors them into ``rect`` (which pygame can only express in integers) for
+collision and drawing.  Movement is integrated in real time, so the same jump
+is 225 px high and one second long at 30, 60 or 144 FPS.
+"""
 
 from __future__ import annotations
 
@@ -10,16 +16,13 @@ from config.constants import (
     FUEL_MAX,
     FUEL_PICKUP_AMOUNT,
     FUEL_SCORE,
-    GRAVITY,
-    JUMP_POWER,
     JUMP_SCORE,
-    PLAYER_RESTITUTION_TOLERANCE,
     PLAYER_SPEED,
     SCREEN_HEIGHT,
     SCREEN_WIDTH,
-    SUPER_JUMP_POWER,
 )
-from entities.platforms import RedPlatform
+from entities.platforms import Platform, RedPlatform
+from systems import physics
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
     from core.world import World
@@ -38,44 +41,86 @@ class Player(pygame.sprite.Sprite):
         self.rect: pygame.Rect = self.image.get_rect(
             center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
         )
+        self.position_x: float = float(self.rect.x)
+        self.position_y: float = float(self.rect.y)
         self.velocity_y: float = 0.0
-        self.speed_x: int = PLAYER_SPEED
+        self.speed_x: float = PLAYER_SPEED
         self.on_ground: bool = False
 
+    # ------------------------------------------------------------------
+    # Placement
+    # ------------------------------------------------------------------
+
+    def teleport(self, x: float, y: float) -> None:
+        """Move the player instantly to the world coordinates *(x, y)*."""
+        self.position_x = x
+        self.position_y = y
+        self.velocity_y = 0.0
+        self.on_ground = False
+        self.sync_rect()
+
+    def sync_rect(self) -> None:
+        """Mirror the float position into ``rect`` for collision and drawing."""
+        self.rect.x = round(self.position_x)
+        self.rect.y = round(self.position_y)
+
+    # ------------------------------------------------------------------
+    # Jumping
+    # ------------------------------------------------------------------
+
     def jump(self) -> None:
-        """Attempt a jump. Uses super-jump power if the buff is active;
-        allows a double jump if the power-up has been collected."""
-        jump_power: float = (
-            SUPER_JUMP_POWER if self.world.super_jump_active else JUMP_POWER
-        )
-        if self.on_ground or self.world.double_jump_available:
-            self.velocity_y = jump_power
-            self.on_ground = False
-            self.world.audio.play_sfx("jump")
-            self.world.score += JUMP_SCORE
-            self.world.jump_count += 1
-            if not self.on_ground and self.world.double_jump_available:
-                self.world.double_jump_available = False
+        """Jump, when grounded or when a mid-air jump is still available.
+
+        A jump that never happens - pressing space in mid-air without the
+        double-jump power-up - costs nothing, so a stray press cannot throw
+        away the super-jump buff.
+        """
+        if not (self.on_ground or self.world.double_jump_available):
+            return
+
+        grounded = self.on_ground
+        self.velocity_y = physics.jump_velocity(self.world.super_jump_active)
+        self.on_ground = False
+        if not grounded:
+            self.world.double_jump_available = False
         self.world.super_jump_active = False
 
-    def update(self, input_manager: InputManager) -> None:
-        """Handle horizontal movement, gravity, collisions, pickups and
-        screen-boundary clamping."""
-        self._move_horizontally(input_manager)
-        self._apply_gravity()
-        self._resolve_platform_collisions()
+        self.world.audio.play_sfx("jump")
+        self.world.score += JUMP_SCORE
+        self.world.jump_count += 1
+
+    # ------------------------------------------------------------------
+    # Simulation
+    # ------------------------------------------------------------------
+
+    def update(self, dt: float, input_manager: InputManager) -> None:
+        """Advance the player by *dt* seconds.
+
+        The horizontal step runs first so it cannot be undone by the landing
+        resolution, and the vertical step remembers where the player's feet
+        started so a platform crossed during this frame is still detected.
+
+        Args:
+            dt: Frame time in seconds.
+            input_manager: Source of the held movement keys.
+        """
+        self._move_horizontally(dt, input_manager)
+
+        previous_bottom = self.rect.bottom
+        self._apply_gravity(dt)
+        self._resolve_landing(previous_bottom)
+
         self._collect_fuel()
         self._check_hazards()
 
-    def _move_horizontally(self, input_manager: InputManager) -> None:
+    def _move_horizontally(self, dt: float, input_manager: InputManager) -> None:
         axis = input_manager.get_movement_axis()
         if axis:
-            self.rect.x += self.speed_x * axis
+            self.position_x += self.speed_x * axis * dt
             self._face(axis)
-        if self.rect.left < 0:
-            self.rect.left = 0
-        if self.rect.right > SCREEN_WIDTH:
-            self.rect.right = SCREEN_WIDTH
+        limit = float(SCREEN_WIDTH - self.rect.width)
+        self.position_x = min(max(self.position_x, 0.0), limit)
+        self.rect.x = round(self.position_x)
 
     def _face(self, axis: int) -> None:
         """Mirror the sprite so the player faces the direction of travel."""
@@ -86,25 +131,48 @@ class Player(pygame.sprite.Sprite):
             self.image = self.original_img
             self.flipped = False
 
-    def _apply_gravity(self) -> None:
-        self.velocity_y += GRAVITY
-        self.rect.y += self.velocity_y
+    def _apply_gravity(self, dt: float) -> None:
+        """Integrate one gravity step in world coordinates."""
+        self.position_y, self.velocity_y = physics.fall_step(
+            self.position_y, self.velocity_y, dt
+        )
+        self.rect.y = round(self.position_y)
         self.on_ground = False
 
-    def _resolve_platform_collisions(self) -> None:
-        """Land the player on platforms it hits while falling."""
+    def _resolve_landing(self, previous_bottom: int) -> None:
+        """Land the player on the highest platform its feet crossed downwards.
+
+        Platforms are one-way - the player passes them from below - so a
+        landing only counts when the feet were at or above a platform's top
+        before this frame's move and are at or below it afterwards.  Testing
+        the crossing rather than an overlap means a fast fall can never tunnel
+        through a platform, whatever the frame rate.
+        """
+        if self.velocity_y <= 0:
+            return
+
+        landing: Platform | None = None
         for platform in self.world.platforms:
+            top = platform.rect.top
+            if top > self.rect.bottom or previous_bottom > top:
+                continue
             if (
-                self.rect.colliderect(platform.rect)
-                and self.velocity_y > 0
-                and self.rect.bottom
-                <= platform.rect.centery + PLAYER_RESTITUTION_TOLERANCE
+                self.rect.right <= platform.rect.left
+                or self.rect.left >= platform.rect.right
             ):
-                self.rect.bottom = platform.rect.top
-                self.velocity_y = 0
-                self.on_ground = True
-                if isinstance(platform, RedPlatform):
-                    platform.start_timer()
+                continue
+            if landing is None or top < landing.rect.top:
+                landing = platform
+
+        if landing is None:
+            return
+
+        self.position_y = float(landing.rect.top - self.rect.height)
+        self.rect.y = round(self.position_y)
+        self.velocity_y = 0.0
+        self.on_ground = True
+        if isinstance(landing, RedPlatform):
+            landing.start_timer()
 
     def _collect_fuel(self) -> None:
         for canister in self.world.fuels:
@@ -120,5 +188,5 @@ class Player(pygame.sprite.Sprite):
             if self.rect.colliderect(meteorite.rect):
                 self.world.end_round()
                 return
-        if self.rect.top > SCREEN_HEIGHT:
+        if self.rect.top > self.world.camera.view_bottom():
             self.world.end_round()
