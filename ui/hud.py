@@ -25,6 +25,7 @@ _MARGIN = 20
 _FUEL_BAR = pygame.Rect(_MARGIN, 140, 200, 20)
 _ALTITUDE_BAR = pygame.Rect(SCREEN_WIDTH - 40, 100, 10, 400)
 _DEBUG_SIZE = 18
+_STAGE_SIZE = 22
 
 
 class Hud:
@@ -43,6 +44,7 @@ class Hud:
     ) -> None:
         """Render the world's stats onto *surface*."""
         self._draw_stats(surface, world)
+        self._draw_stage(surface, world)
         self._draw_fuel_bar(surface, world)
         self._draw_altitude_bar(surface, world.altitude_progress)
         if show_debug:
@@ -59,6 +61,24 @@ class Hud:
             self.text.draw(
                 surface, line, _MARGIN, _MARGIN + index * _LINE_HEIGHT, TEXT_COLOR
             )
+
+    def _draw_stage(self, surface: pygame.Surface, world: World) -> None:
+        """Name the stage of the climb the player has reached.
+
+        The climb gets harder as it goes, so the player is told which part of
+        it they are in: it turns "I died" into "I reached Drift", which is
+        something a run can be measured against.
+        """
+        label = f"Stage: {world.tier.name}"
+        width = self.text.render(label, _STAGE_SIZE).get_width()
+        self.text.draw(
+            surface,
+            label,
+            SCREEN_WIDTH - _MARGIN - width,
+            _MARGIN,
+            TEXT_COLOR,
+            _STAGE_SIZE,
+        )
 
     @staticmethod
     def _draw_fuel_bar(surface: pygame.Surface, world: World) -> None:
@@ -88,7 +108,8 @@ class Hud:
         self, surface: pygame.Surface, world: World, fps: float
     ) -> None:
         info = (
-            f"FPS {fps:5.1f}  camera {world.camera_y:7.1f}  "
+            f"FPS {fps:5.1f}  altitude {world.altitude:7.1f}  "
+            f"camera {world.camera_y:7.1f}  "
             f"entities {len(world.platforms)}p/{len(world.fuels)}f/"
             f"{len(world.meteorites)}m"
         )

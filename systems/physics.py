@@ -35,6 +35,11 @@ from config.constants import (
 PLATFORM_PADDING: float = (PLATFORM_SIZE[0] + PLAYER_SIZE[0]) / 2
 
 
+def platform_padding(platform_width: float = PLATFORM_SIZE[0]) -> float:
+    """Return the centre-to-centre slack a *platform_width* px pad grants."""
+    return (platform_width + PLAYER_SIZE[0]) / 2
+
+
 def fall_step(
     position_y: float,
     velocity_y: float,
@@ -95,12 +100,18 @@ def max_vertical_gap() -> float:
     return apex_height() * PLATFORM_GAP_HEADROOM
 
 
-def reach_band(vertical_gap: float, launch: float = JUMP_VELOCITY) -> float:
+def reach_band(
+    vertical_gap: float,
+    launch: float = JUMP_VELOCITY,
+    platform_width: float = PLATFORM_SIZE[0],
+) -> float:
     """Return the furthest centre-to-centre distance a jump can bridge.
 
     Args:
         vertical_gap: Height difference between the two platform centres.
         launch: Launch velocity to plan the jump with.
+        platform_width: Width of the platform being jumped onto.  A wide pad is
+            a wide target, so it grants proportionally more usable distance.
 
     Returns:
         The usable horizontal distance in pixels, already reduced by
@@ -110,12 +121,17 @@ def reach_band(vertical_gap: float, launch: float = JUMP_VELOCITY) -> float:
         return 0.0
     return max(
         0.0,
-        horizontal_reach(vertical_gap, launch) + PLATFORM_PADDING - PLATFORM_REACH_SAFETY,
+        horizontal_reach(vertical_gap, launch)
+        + platform_padding(platform_width)
+        - PLATFORM_REACH_SAFETY,
     )
 
 
 def platform_reachable(
-    vertical_gap: float, horizontal_gap: float, launch: float = JUMP_VELOCITY
+    vertical_gap: float,
+    horizontal_gap: float,
+    launch: float = JUMP_VELOCITY,
+    platform_width: float = PLATFORM_SIZE[0],
 ) -> bool:
     """Report whether a jump can carry the player from one platform to another.
 
@@ -123,6 +139,7 @@ def platform_reachable(
         vertical_gap: How much higher the target platform is.
         horizontal_gap: Distance between the two platform centres.
         launch: Launch velocity to plan the jump with.
+        platform_width: Width of the target platform.
 
     Returns:
         True when the target is inside the jump envelope (dropping down to a
@@ -130,4 +147,4 @@ def platform_reachable(
     """
     if vertical_gap <= 0:
         return True
-    return horizontal_gap <= reach_band(vertical_gap, launch)
+    return horizontal_gap <= reach_band(vertical_gap, launch, platform_width)

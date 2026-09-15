@@ -77,7 +77,10 @@ class PlayingState(State):
             self.game.states.push_state(GameState.PAUSED, self.world)
             return
         if input_manager.was_key_pressed(pygame.K_SPACE):
-            self.world.player.jump()
+            # Buffered rather than executed: a press a moment before the player
+            # lands still jumps, so the landing-then-jump rhythm is not lost to
+            # a frame of timing.
+            self.world.player.press_jump()
 
         self.world.update(dt, input_manager)
         if self.world.is_over:

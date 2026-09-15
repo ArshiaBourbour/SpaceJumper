@@ -25,29 +25,52 @@ import pygame
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.constants import (  # noqa: E402
+    CAMERA_DEAD_ZONE,
+    FUEL_HOVER,
     FUEL_MAX,
     JUMP_VELOCITY,
     MAX_FALL_SPEED,
     MIN_FUEL_CANISTERS,
+    METEORITE_SPAWN_CLEARANCE,
     PLATFORM_CULL_MARGIN,
     PLATFORM_MOVE_SPEED,
-    PLATFORM_SPAWN_GAP_MAX,
-    PLATFORM_SPAWN_GAP_MIN,
+    PLAYER_HAZARD_INSET,
     SCREEN_HEIGHT,
     SCREEN_WIDTH,
+    START_PLATFORM_SIZE,
+)
+from config.difficulty import (  # noqa: E402
+    BREATHER_EVERY,
+    BREATHER_REACH_USE,
+    BREATHER_WIDTH,
+    HARD_LINK_REACH_USE,
+    LEVEL_FLOOR,
+    SPIKE_REACH_LIMIT,
+    TIERS,
+    climb_altitude,
+    tier_at,
 )
 from config.settings import Settings  # noqa: E402
 from core.game import Game  # noqa: E402
 from core.game_state import GameState  # noqa: E402
 from core.world import World  # noqa: E402
 from entities import Fuel, Player  # noqa: E402
+from entities.meteorite import Meteorite  # noqa: E402
 from entities.platforms import BluePlatform, Platform, RedPlatform  # noqa: E402
 from managers.resource_manager import ResourceManager  # noqa: E402
 from managers.save_manager import SaveManager  # noqa: E402
 from states.playing import PlayingState  # noqa: E402
 from systems.input import InputManager  # noqa: E402
-from systems.physics import apex_height, platform_reachable  # noqa: E402
-from utils.platform_factory import generate_reachable_platform  # noqa: E402
+from systems.physics import (  # noqa: E402
+    apex_height,
+    max_vertical_gap,
+    platform_reachable,
+    reach_band,
+)
+from utils.platform_factory import (  # noqa: E402
+    ClimbGenerator,
+    generate_platform,
+)
 
 FRAME = 1.0 / 60.0
 
@@ -421,9 +444,22 @@ def test_gameplay() -> None:
     state = harness.start_round("pilot")
     world = state.world
     assert world is not None
-    check(len(world.platforms) == 25, "25 platforms are spawned at the start")
-    check(len(world.fuels) == 2, "fuel canisters spawn without crashing")
-    check(len(world.meteorites) == 2, "meteorites spawn")
+    check(
+        len(world.platforms) >= 10,
+        f"the opening world is a full climb ({len(world.platforms)} platforms)",
+    )
+    check(
+        len(world.fuels) == MIN_FUEL_CANISTERS,
+        "fuel canisters spawn without crashing",
+    )
+    check(
+        len(world.meteorites) == 0,
+        "the opening stage holds no hazards",
+    )
+    check(
+        world.tier is TIERS[0],
+        f"a fresh round starts in the first stage ({world.tier.name})",
+    )
 
     start_x = world.player.rect.x
     pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, unicode=""))
@@ -856,7 +892,7 @@ def test_time_based_timers() -> None:
         )
 
     for label, dt in {"30 FPS": FRAME_RATES["30 FPS"], "120 FPS": FRAME_RATES["120 FPS"]}.items():
-        mover = BluePlatform(300, 300)
+        mover = BluePlatform(300, 300, patrol=200)
         for _ in range(round(1.0 / dt)):
             mover.update(dt)
         check(
@@ -865,6 +901,35 @@ def test_time_based_timers() -> None:
             f"(got {mover.rect.centerx - 300} px)",
         )
 
+    mover = BluePlatform(300, 300, patrol=120)
+    travelled = 0
+    furthest = 300
+    nearest = 300
+    while travelled < 12.0:
+        mover.update(FRAME_RATES["60 FPS"])
+        travelled += FRAME_RATES["60 FPS"]
+        furthest = max(furthest, mover.rect.centerx)
+        nearest = min(nearest, mover.rect.centerx)
+    check(
+        furthest - 300 <= 120 + 4 and 300 - nearest <= 120 + 4,
+        f"a moving platform stays inside its patrol range "
+        f"(-{300 - nearest}px..+{furthest - 300}px of 120 px)",
+    )
+
+
+def _climb_links(seed: int, links: int = 150) -> list[tuple[Platform, float]]:
+    """Walk the climb generator and return each link's platform and its demand."""
+    random.seed(seed)
+    generator = ClimbGenerator()
+    pad = Platform(SCREEN_WIDTH / 2, SCREEN_HEIGHT, START_PLATFORM_SIZE)
+    generator.reset(pad)
+    walk = [pad]
+    demands: list[float] = []
+    for _ in range(links):
+        walk.append(generator.next_platform())
+        demands.append(generator.realised)
+    return list(zip(walk[1:], demands))
+
 
 def test_platform_reachability() -> None:
     section("Platform reachability")
@@ -872,27 +937,26 @@ def test_platform_reachability() -> None:
     blocked: list[float] = []
     gaps: list[float] = []
     spans: list[float] = []
+    worst_demand = 0.0
 
     for seed in range(12):
-        random.seed(seed)
-        platforms = pygame.sprite.Group()
-        y = float(SCREEN_HEIGHT)
-        for _ in range(150):
-            platform = generate_reachable_platform(y, platforms)
-            platforms.add(platform)
-            y = platform.rect.centery - random.uniform(
-                PLATFORM_SPAWN_GAP_MIN, PLATFORM_SPAWN_GAP_MAX
-            )
-
-        ladder = sorted(platforms, key=lambda item: item.rect.centery, reverse=True)
+        walk = _climb_links(seed)
+        ladder = _ladder(seed)
         for lower, upper in zip(ladder, ladder[1:]):
             links += 1
             vertical = lower.rect.centery - upper.rect.centery
             horizontal = abs(lower.rect.centerx - upper.rect.centerx)
-            if not platform_reachable(vertical, horizontal):
+            if not platform_reachable(vertical, horizontal, platform_width=upper.rect.width):
                 blocked.append(horizontal)
             gaps.append(vertical)
-        spans.append(max(item.rect.centerx for item in platforms) - min(item.rect.centerx for item in platforms))
+            band = reach_band(vertical, platform_width=upper.rect.width)
+            worst_demand = max(worst_demand, horizontal / band if band else 9.9)
+        positions = [item.rect.centerx for item in ladder]
+        spans.append(max(positions) - min(positions))
+        check(
+            len(walk) == len(ladder) - 1,
+            f"seed {seed}: the generator walk reports the ladder it built",
+        )
 
     check(
         not blocked,
@@ -906,6 +970,443 @@ def test_platform_reachability() -> None:
     check(
         min(spans) > 100.0,
         f"generated platforms still vary horizontally (spread {min(spans):.0f} px)",
+    )
+    check(
+        worst_demand < 1.0,
+        f"no generated jump asks for the whole envelope (worst {worst_demand:.2f})",
+    )
+
+
+def _ladder(seed: int) -> list[Platform]:
+    """Return the platforms of one climb, bottom first."""
+    random.seed(seed)
+    generator = ClimbGenerator()
+    pad = Platform(SCREEN_WIDTH / 2, SCREEN_HEIGHT, START_PLATFORM_SIZE)
+    generator.reset(pad)
+    ladder = [pad]
+    for _ in range(150):
+        ladder.append(generator.next_platform())
+    return ladder
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 - difficulty, fairness and accessibility
+# ---------------------------------------------------------------------------
+
+
+def test_difficulty_curve_is_monotone() -> None:
+    section("Difficulty curve")
+    previous = TIERS[0]
+    for tier in TIERS:
+        check(
+            tier.reach_use >= previous.reach_use
+            and tier.rise[0] >= previous.rise[0]
+            and tier.meteorites >= previous.meteorites
+            and min(tier.widths) <= min(previous.widths),
+            f"{tier.name} is at least as demanding as {previous.name} and no leap beyond it",
+        )
+        check(
+            max(tier.widths) - min(previous.widths) <= 70,
+            f"{tier.name}: platform widths shrink gradually ({previous.widths} -> {tier.widths})",
+        )
+        previous = tier
+
+    check(
+        TIERS[0].meteorites == 0 and set(TIERS[0].weights) == {"normal"},
+        "the opening stage has no hazards, no moving and no vanishing platforms",
+    )
+    check(
+        tier_at(0.0) is TIERS[0] and tier_at(10.0 ** 6) is TIERS[-1],
+        "altitude selects a stage, including beyond the last one",
+    )
+    check(
+        climb_altitude(SCREEN_HEIGHT) == 0.0
+        and climb_altitude(SCREEN_HEIGHT - 500.0) == 500.0,
+        "climb altitude is measured from the starting pad",
+    )
+    check(
+        TIERS[0].patrol == 0.0 and TIERS[-1].patrol > 0.0,
+        "platform movement only appears once the player has learnt the jump",
+    )
+
+
+def test_climb_pacing() -> None:
+    section("Difficulty pacing")
+    import statistics
+
+    biggest_step_up = 0.0
+    biggest_rise_step = 0.0
+    recovery_after_hard = 0
+    hard_links = 0
+    overshoot: list[str] = []
+    links = 0
+    by_stage: dict[str, list[float]] = {}
+    every_demand: list[float] = []
+
+    for seed in range(12):
+        ladder = _ladder(seed)
+        demands: list[float] = []
+        rises: list[float] = []
+        for lower, upper in zip(ladder, ladder[1:]):
+            links += 1
+            rise = lower.rect.top - upper.rect.top
+            band = reach_band(rise, platform_width=upper.rect.width)
+            demand = abs(lower.rect.centerx - upper.rect.centerx) / band if band else 9.9
+            rises.append(rise)
+            if demands:
+                biggest_step_up = max(biggest_step_up, demand - demands[-1])
+                biggest_rise_step = max(biggest_rise_step, rise - rises[-2])
+                if demands[-1] >= HARD_LINK_REACH_USE:
+                    hard_links += 1
+                    recovery_after_hard += upper.rect.width == BREATHER_WIDTH
+            demands.append(demand)
+            every_demand.append(demand)
+            tier = tier_at(climb_altitude(upper.rect.centery))
+            by_stage.setdefault(tier.name, []).append(demand)
+            if demand > tier.reach_use + 1e-6:
+                overshoot.append(f"{demand:.2f} > {tier.reach_use:.2f}")
+
+    def percentile(values: list[float], fraction: float) -> float:
+        ordered = sorted(values)
+        return ordered[min(len(ordered) - 1, int(fraction * len(ordered)))]
+
+    peaks = [
+        percentile(by_stage[tier.name], 0.9) for tier in TIERS if tier.name in by_stage
+    ]
+
+    check(
+        biggest_step_up <= SPIKE_REACH_LIMIT + 0.02,
+        f"no jump is a sudden step up in difficulty "
+        f"(+{biggest_step_up:.2f} over {links} links, limit +{SPIKE_REACH_LIMIT:.2f})",
+    )
+    check(
+        biggest_rise_step <= 25.0 + 1.0,
+        f"the vertical gap never jumps either (+{biggest_rise_step:.0f} px)",
+    )
+    check(
+        recovery_after_hard == hard_links,
+        f"every demanding jump is answered with a recovery platform "
+        f"({recovery_after_hard}/{hard_links})",
+    )
+    check(not overshoot, f"no stage asks for more than it allows ({overshoot[:3]})")
+    check(
+        max(every_demand) > 0.6,
+        f"the late climb really does ask for hard jumps "
+        f"(worst {max(every_demand):.2f} of the envelope)",
+    )
+    check(
+        peaks[-1] > peaks[0] + 0.2,
+        f"later stages really are harder (hardest tenth of jumps "
+        f"{peaks[0]:.2f} -> {peaks[-1]:.2f} of the envelope)",
+    )
+    check(
+        all(later >= earlier - 0.05 for earlier, later in zip(peaks, peaks[1:])),
+        f"the climb gets harder stage by stage "
+        f"({', '.join(f'{peak:.2f}' for peak in peaks)})",
+    )
+
+
+def test_opening_is_gentle() -> None:
+    section("Fairness: the opening climb")
+    widths: set[int] = set()
+    worst = 0.0
+    hazards = 0
+    fragile = 0
+    for seed in range(20):
+        random.seed(seed)
+        harness = Harness()
+        try:
+            state = harness.start_round("gentle")
+            world = state.world
+            assert world is not None
+            ladder = sorted(
+                world.platforms, key=lambda item: item.rect.centery, reverse=True
+            )
+            for lower, upper in zip(ladder, ladder[1:5]):
+                if climb_altitude(upper.rect.centery) > TIERS[0].start + 300.0:
+                    break
+                band = reach_band(
+                    lower.rect.top - upper.rect.top, platform_width=upper.rect.width
+                )
+                worst = max(
+                    worst, abs(lower.rect.centerx - upper.rect.centerx) / band
+                )
+                widths.add(upper.rect.width)
+            hazards += len(world.meteorites)
+            fragile += sum(
+                isinstance(item, RedPlatform)
+                for item in world.platforms
+                if climb_altitude(item.rect.centery) <= TIERS[0].start + 300.0
+            )
+        finally:
+            harness.close()
+
+    check(
+        worst <= TIERS[0].reach_use + 0.02,
+        f"the first jumps stay inside the opening stage's allowance ({worst:.2f})",
+    )
+    check(
+        min(widths) >= 140,
+        f"the opening platforms are wide ({sorted(widths)}) let alone reachable",
+    )
+    check(hazards == 0, "no hazards anywhere in the opening climb")
+    check(fragile == 0, "no vanishing platforms in the opening climb")
+
+
+def test_hazard_fairness() -> None:
+    section("Fairness: hazards")
+    hazards = [tier for tier in TIERS if tier.meteorites]
+    check(bool(hazards), "later stages do introduce hazards")
+
+    random.seed(9)
+    harness = Harness()
+    try:
+        state = harness.start_round("hazard")
+        world = state.world
+        assert world is not None
+        world.player.teleport(
+            world.player.position_x, 40.0 - 4000.0
+        )  # high enough for the later stages
+        harness.step(2)
+        wanted = world.tier.meteorites
+        check(
+            wanted > 0 and len(world.meteorites) == wanted,
+            f"a hazard stage holds exactly its number of hazards "
+            f"({len(world.meteorites)} of {wanted})",
+        )
+        check(
+            all(
+                item.rect.bottom < world.camera.view_bottom()
+                for item in world.meteorites
+            ),
+            "hazards stay inside the play area they are recycled in",
+        )
+        # A hazard only ever enters from just above the top of the view.
+        entering = [item for item in world.meteorites if item.wait > 0]
+        check(
+            bool(entering)
+            and all(
+                abs(item.rect.centerx - world.player.rect.centerx)
+                >= METEORITE_SPAWN_CLEARANCE - 1.0
+                for item in entering
+            ),
+            "no hazard waits directly over the player's column",
+        )
+        check(
+            bool(entering)
+            and all(
+                world.camera.view_top() - item.rect.bottom <= 120.0
+                for item in entering
+            ),
+            "a hazard about to fall sits just above the top of the view, so the "
+            "player watches the whole fall",
+        )
+
+        # Surplus hazards are retired when the player falls back a stage.
+        world.player.teleport(world.player.position_x, SCREEN_HEIGHT - 100.0)
+        for _ in range(3):
+            harness.step()
+        check(
+            len(world.meteorites) <= world.tier.meteorites,
+            f"falling back to an easier stage retires its surplus hazards "
+            f"({len(world.meteorites)} of {world.tier.meteorites})",
+        )
+    finally:
+        harness.close()
+
+
+def test_forgiving_hitboxes() -> None:
+    section("Fairness: forgiving hitboxes")
+    harness, world, _ = _isolated_setup()
+    try:
+        player = world.player
+        meteorite = Meteorite(world)
+        world.meteorites.add(meteorite)
+        # Overlap the sprite's corner only, by less than the inset.
+        meteorite.rect.topleft = (
+            player.rect.left - meteorite.rect.width + 2,
+            player.rect.top - meteorite.rect.height + 2,
+        )
+        player._check_hazards()
+        check(
+            not world.is_over,
+            "a graze that only clips the sprite corner is not a death",
+        )
+        meteorite.rect.center = player.rect.center
+        player._check_hazards()
+        check(world.is_over, "a hazard squarely on the player still ends the round")
+        check(
+            player.hazard_hitbox.width == player.rect.width - 2 * PLAYER_HAZARD_INSET,
+            "the player's hazard hitbox is smaller than the sprite",
+        )
+    finally:
+        harness.close()
+
+
+def test_fuel_sits_on_the_route() -> None:
+    section("Fairness: fuel")
+    above = 0
+    total = 0
+    reachable = 0
+    seen: set[int] = set()
+    random.seed(5)
+    harness = Harness()
+    try:
+        state = harness.start_round("fuel")
+        world = state.world
+        assert world is not None
+        for _ in range(120):
+            world.fuel_level = FUEL_MAX
+            world.player.teleport(
+                world.player.rect.centerx,
+                max(world.camera.view_top() - 200.0, world.player.position_y),
+            )
+            harness.step()
+            for canister in world.fuels:
+                if id(canister) in seen:
+                    continue
+                seen.add(id(canister))
+                total += 1
+                hovering = any(
+                    abs(canister.rect.centerx - platform.rect.centerx) < 2
+                    and abs(canister.rect.centery - (platform.rect.top - FUEL_HOVER)) < 2
+                    for platform in world.platforms
+                )
+                above += hovering
+                if hovering:
+                    platform = next(
+                        item
+                        for item in world.platforms
+                        if abs(item.rect.centerx - canister.rect.centerx) < 2
+                    )
+                    reachable += apex_height() >= (platform.rect.top - canister.rect.top)
+    finally:
+        harness.close()
+    check(
+        total > 0 and above / total > 0.95,
+        f"canisters sit above a platform on the route ({above}/{total})",
+    )
+    check(
+        reachable == above,
+        f"a canister is one jump from the platform under it ({reachable}/{above})",
+    )
+    check(
+        40.0 <= FUEL_HOVER <= apex_height(),
+        f"a canister is out of reach of standing but inside a jump ({FUEL_HOVER:.0f} px)",
+    )
+
+
+def test_jump_buffer() -> None:
+    section("Fairness: jump responsiveness")
+    for label, dt in FRAME_RATES.items():
+        harness, world, platform = _isolated_setup(y=SCREEN_HEIGHT - 200)
+        try:
+            player = world.player
+            player.teleport(
+                float(platform.rect.centerx),
+                float(platform.rect.top - player.rect.height - 40.0),
+            )
+            player.velocity_y = MAX_FALL_SPEED / 2
+            inputs = InputManager()
+            player.press_jump()  # pressed just before touching down
+            elapsed = 0.0
+            while elapsed < 1.0 and not player.on_ground:
+                player.update(dt, inputs)
+                elapsed += dt
+            check(
+                world.jump_count == 1,
+                f"{label}: a jump pressed before landing still fires "
+                f"(landed at {elapsed:.2f}s, jumps {world.jump_count})",
+            )
+        finally:
+            harness.close()
+
+    harness, world, platform = _isolated_setup(y=SCREEN_HEIGHT - 200)
+    try:
+        player = world.player
+        player.teleport(400.0, 100.0)
+        player.velocity_y = 300.0
+        player.press_jump()
+        inputs = InputManager()
+        for _ in range(10):
+            player.update(FRAME, inputs)
+        check(
+            world.jump_count == 0,
+            "a jump pressed in mid-air is not queued into a double jump",
+        )
+    finally:
+        harness.close()
+
+
+def test_stage_is_reported() -> None:
+    section("Fairness: the player is told the stage")
+    harness = Harness()
+    try:
+        state = harness.start_round("stages")
+        world = state.world
+        assert world is not None
+        opening = world.tier.name
+        check(opening == TIERS[0].name, f"a round reports its opening stage ({opening})")
+        world.player.teleport(world.player.position_x, SCREEN_HEIGHT - 5000.0)
+        harness.step()
+        check(
+            world.tier is TIERS[-1] and world.result().stage == TIERS[-1].name,
+            f"the stage follows the climb ({world.result().stage})",
+        )
+        check(
+            world.result().altitude > 4000.0,
+            f"the round result carries the altitude reached "
+            f"({world.result().altitude:.0f} px)",
+        )
+    finally:
+        harness.close()
+
+
+def test_breather_rule() -> None:
+    section("Fairness: recovery platforms")
+    generator = ClimbGenerator()
+    pad = Platform(SCREEN_WIDTH / 2, SCREEN_HEIGHT, START_PLATFORM_SIZE)
+    generator.reset(pad)
+    generator.realised = HARD_LINK_REACH_USE
+    generator.links_since_breather = 1
+    check(generator._breather_due(), "a demanding link is followed by a recovery")
+
+    generator.reset(pad)
+    generator.realised = 0.1
+    generator.links_since_breather = BREATHER_EVERY
+    check(generator._breather_due(), "recovery platforms arrive on a schedule")
+
+    generator.reset(pad)
+    generator.links_since_breather = 0
+    check(
+        not generator._breather_due(),
+        "two recovery platforms never follow each other",
+    )
+
+    random.seed(21)
+    generator.reset(pad)
+    widths = [generator.next_platform().rect.width for _ in range(40)]
+    run = 0
+    longest = 0
+    for width in widths:
+        run = 0 if width == BREATHER_WIDTH else run + 1
+        longest = max(longest, run)
+    check(
+        longest <= BREATHER_EVERY,
+        f"the player never goes more than {BREATHER_EVERY} jumps without a rest "
+        f"(longest run {longest})",
+    )
+    check(
+        any(width == BREATHER_WIDTH for width in widths),
+        "recovery platforms are reachable in a normal climb",
+    )
+    check(
+        BREATHER_REACH_USE < TIERS[-1].reach_use,
+        "a recovery platform is easier than the hardest stage",
+    )
+    check(
+        max_vertical_gap() > max(tier.rise[1] for tier in TIERS),
+        "every stage's tallest gap is inside the jump",
     )
 
 
@@ -1087,7 +1588,8 @@ def test_camera_separates_world_and_screen() -> None:
         still = [item for item in world.platforms if type(item) is Platform][:5]
         before = {id(item): item.rect.topleft for item in still}
 
-        target = player.position_y - 200.0
+        # Climb the player's head well above the camera's dead zone.
+        target = world.camera.to_world_y(CAMERA_DEAD_ZONE - 120.0)
         player.teleport(player.position_x, target)
         harness.step()
 
@@ -1196,13 +1698,24 @@ def main() -> int:
     test_camera_separates_world_and_screen()
     test_pause_during_jump()
 
+    # Phase 4 - difficulty, fairness and accessibility.
+    test_difficulty_curve_is_monotone()
+    test_climb_pacing()
+    test_opening_is_gentle()
+    test_breather_rule()
+    test_hazard_fairness()
+    test_forgiving_hitboxes()
+    test_fuel_sits_on_the_route()
+    test_jump_buffer()
+    test_stage_is_reported()
+
     print(f"\n{_checks - len(_failures)}/{_checks} checks passed")
     if _failures:
         print("Failures:")
         for failure in _failures:
             print(f"  - {failure}")
         return 1
-    print("All Phase 2 and Phase 3 regression checks passed.")
+    print("All Phase 2, Phase 3 and Phase 4 regression checks passed.")
     return 0
 
 

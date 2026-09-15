@@ -13,6 +13,11 @@ One frame runs in a fixed order::
     moving platforms -> hazards -> player -> pickups -> camera -> spawning
 
 so collisions always use the positions the player can actually see.
+
+How hard the climb is comes from :mod:`config.difficulty`, which scales gaps,
+platform widths, the platform mix, the hazard count and the reach a jump may
+demand with the player's altitude.  The world reports which stage the player is
+in; it does not decide what a stage means.
 """
 
 from __future__ import annotations
@@ -29,15 +34,12 @@ from config.constants import (
     FUEL_IMG_PATH,
     FUEL_SIZE,
     FUEL_START,
-    INITIAL_METEORITE_COUNT,
-    INITIAL_PLATFORM_COUNT,
+    INITIAL_CLIMB_HEIGHT,
+    INITIAL_PLATFORM_LIMIT,
     MAX_PLATFORM_SPAWNS_PER_FRAME,
     MIN_FUEL_CANISTERS,
     PLATFORM_CULL_MARGIN,
-    PLATFORM_SPAWN_GAP_MAX,
-    PLATFORM_SPAWN_GAP_MIN,
     PLATFORM_SPAWN_HEADROOM,
-    PLATFORM_VERTICAL_SPACING,
     PLAYER_IMG_PATH,
     PLAYER_SIZE,
     POWERUP_KINDS,
@@ -47,15 +49,16 @@ from config.constants import (
     SLOW_MOTION_DURATION,
     SLOW_MOTION_FACTOR,
     START_PLATFORM_SIZE,
+    START_SPAWN_DROP,
 )
+from config.difficulty import DifficultyTier, climb_altitude, tier_at
 from entities import Fuel, Meteorite, Player, PowerUp
 from entities.platforms import Platform
 from entities.star import Starfield
 from managers.audio_manager import AudioManager
 from managers.resource_manager import ResourceManager
-from systems import physics
 from systems.camera import Camera
-from utils.platform_factory import generate_reachable_platform
+from utils.platform_factory import ClimbGenerator
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
     from systems.input import InputManager
@@ -65,9 +68,11 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
 class RoundResult:
     """Outcome of a finished round, handed to the game-over screen."""
 
-    score: int
-    jumps: int
-    duration: float
+    score: int = 0
+    jumps: int = 0
+    duration: float = 0.0
+    altitude: float = 0.0
+    stage: str = ""
 
 
 class World:
@@ -94,6 +99,7 @@ class World:
         )
 
         self.camera = Camera()
+        self.climb = ClimbGenerator()
         self.platforms = pygame.sprite.Group()
         self.fuels = pygame.sprite.Group()
         self.powerups = pygame.sprite.Group()
@@ -104,6 +110,16 @@ class World:
     # ------------------------------------------------------------------
     # State
     # ------------------------------------------------------------------
+
+    @property
+    def altitude(self) -> float:
+        """How far above the starting pad the player has climbed, in pixels."""
+        return climb_altitude(self.player.rect.centery)
+
+    @property
+    def tier(self) -> DifficultyTier:
+        """The stage of the climb the player is in."""
+        return tier_at(self.altitude)
 
     def reset(self) -> None:
         """Return the world to its starting state for a fresh run."""
@@ -124,12 +140,22 @@ class World:
         self.powerups.empty()
         self.meteorites.empty()
 
-        for _ in range(INITIAL_METEORITE_COUNT):
-            self.meteorites.add(Meteorite(self))
-        for step in range(INITIAL_PLATFORM_COUNT):
-            y = SCREEN_HEIGHT - step * PLATFORM_VERTICAL_SPACING
-            self.platforms.add(generate_reachable_platform(y, self.platforms))
-        self._ensure_spawn_platform()
+        pad = Platform(
+            self.player.rect.centerx, SCREEN_HEIGHT, START_PLATFORM_SIZE
+        )
+        self.platforms.add(pad)
+        self.climb.reset(pad)
+        self._extend_climb(
+            SCREEN_HEIGHT - INITIAL_CLIMB_HEIGHT, INITIAL_PLATFORM_LIMIT
+        )
+        # Drop the player onto the pad instead of leaving it somewhere in the
+        # middle of the climb: which platform the opening fall happens to find
+        # was a lottery, and it decided how the run started.
+        self.player.teleport(
+            pad.rect.centerx - PLAYER_SIZE[0] / 2,
+            pad.rect.top - PLAYER_SIZE[1] - START_SPAWN_DROP,
+        )
+        self._keep_hazards()
         self._keep_fuel_available()
 
     @property
@@ -145,7 +171,11 @@ class World:
     def result(self) -> RoundResult:
         """Return a summary of the round for the game-over screen."""
         return RoundResult(
-            score=self.score, jumps=self.jump_count, duration=self.timer
+            score=self.score,
+            jumps=self.jump_count,
+            duration=self.timer,
+            altitude=self.altitude,
+            stage=self.tier.name,
         )
 
     def end_round(self) -> None:
@@ -177,63 +207,66 @@ class World:
         self._consume_fuel(dt)
 
         self.camera.follow(self.player.rect.top, dt, self.starfield)
-        self._spawn_platforms()
-        self._keep_fuel_available()
+        self._extend_climb(
+            self.camera.view_top() - PLATFORM_SPAWN_HEADROOM,
+            MAX_PLATFORM_SPAWNS_PER_FRAME,
+        )
+        # Clean up before topping anything back up, so what the camera has left
+        # behind is replaced within the same frame instead of the next one.
         self._recycle_objects()
+        self._keep_hazards()
+        self._keep_fuel_available()
 
     # ------------------------------------------------------------------
     # Spawning and cleanup
     # ------------------------------------------------------------------
 
-    def _spawn_platforms(self) -> None:
-        """Extend the climb upwards with platforms the player can reach."""
-        ceiling = self.camera.view_top() - PLATFORM_SPAWN_HEADROOM
-        gap_limit = min(PLATFORM_SPAWN_GAP_MAX, physics.max_vertical_gap())
-        spawned = 0
+    def _extend_climb(self, ceiling: float, limit: int) -> None:
+        """Build platforms upwards until the world reaches *ceiling*.
 
-        while spawned < MAX_PLATFORM_SPAWNS_PER_FRAME:
-            highest = self._highest_platform_y()
-            if highest is None or highest <= ceiling:
-                break
-            y = highest - random.uniform(PLATFORM_SPAWN_GAP_MIN, gap_limit)
-            platform = generate_reachable_platform(y, self.platforms)
-            self.platforms.add(platform)
-            spawned += 1
-            if random.random() < POWERUP_SPAWN_CHANCE:
-                kind = random.choice(POWERUP_KINDS)
-                self.powerups.add(
-                    PowerUp(
-                        platform.rect.centerx,
-                        platform.rect.centery - POWERUP_SPAWN_OFFSET,
-                        kind,
-                    )
-                )
-
-    def _highest_platform_y(self) -> float | None:
-        """Return the world y of the topmost platform, if there is one."""
-        tops = [platform.rect.centery for platform in self.platforms]
-        return min(tops) if tops else None
-
-    def _ensure_spawn_platform(self) -> None:
-        """Turn the opening into a fair start.
-
-        The player spawns in mid-air and falls, so the platform it lands on has
-        to be there, has to be solid and has to leave room to react.  With a
-        purely random layout no platform sat under the spawn column in about
-        half of all rounds, and simply pressing a direction during the opening
-        fall ended *every* round, so the lowest platform is replaced by a wide
-        plain pad centred under the spawn.  Nothing above it changes, so the
-        climb itself is as hard as it always was.
+        The climb is generated one fair jump at a time from the current
+        frontier, so it grows as the player climbs instead of being decided in
+        advance: at 3000 px the generator is working with the later stages of
+        the curve, not with the opening one.
         """
-        lowest = max(self.platforms, key=lambda platform: platform.rect.centery)
-        self.platforms.remove(lowest)
-        self.platforms.add(
-            Platform(
-                self.player.rect.centerx,
-                lowest.rect.centery,
-                START_PLATFORM_SIZE,
+        for _ in range(limit):
+            anchor = self.climb.anchor
+            if anchor is None or anchor.rect.centery <= ceiling:
+                break
+            platform = self.climb.next_platform()
+            self.platforms.add(platform)
+            self._maybe_spawn_powerup(platform)
+
+    def _maybe_spawn_powerup(self, platform: Platform) -> None:
+        """Occasionally place a power-up above a freshly generated platform."""
+        if not self.tier.powerups or random.random() >= POWERUP_SPAWN_CHANCE:
+            return
+        self.powerups.add(
+            PowerUp(
+                platform.rect.centerx,
+                platform.rect.centery - POWERUP_SPAWN_OFFSET,
+                random.choice(POWERUP_KINDS),
             )
         )
+
+    def _keep_hazards(self) -> None:
+        """Keep exactly as many hazards alive as the current stage calls for.
+
+        A player who falls back into an easier stage should not keep facing the
+        hazards of the harder one, so surplus meteorites are retired - but only
+        while they are hidden above the view, where removing one cannot be seen.
+        """
+        wanted = self.tier.meteorites
+        while len(self.meteorites) < wanted:
+            self.meteorites.add(Meteorite(self))
+        if len(self.meteorites) <= wanted:
+            return
+        view_top = self.camera.view_top()
+        for meteorite in list(self.meteorites):
+            if len(self.meteorites) <= wanted:
+                break
+            if meteorite.rect.bottom < view_top:
+                meteorite.kill()
 
     def _keep_fuel_available(self) -> None:
         """Top the world back up to the configured number of canisters."""

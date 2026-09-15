@@ -16,7 +16,9 @@ from config.constants import (
     FUEL_MAX,
     FUEL_PICKUP_AMOUNT,
     FUEL_SCORE,
+    JUMP_BUFFER_TIME,
     JUMP_SCORE,
+    PLAYER_HAZARD_INSET,
     PLAYER_SPEED,
     SCREEN_HEIGHT,
     SCREEN_WIDTH,
@@ -46,6 +48,17 @@ class Player(pygame.sprite.Sprite):
         self.velocity_y: float = 0.0
         self.speed_x: float = PLAYER_SPEED
         self.on_ground: bool = False
+        self.jump_buffer: float = 0.0
+
+    @property
+    def hazard_hitbox(self) -> pygame.Rect:
+        """Return the rect a hazard collision is judged against.
+
+        Slightly smaller than the sprite, so a graze reads as a graze instead
+        of as a death the player cannot explain.
+        """
+        inset = 2 * PLAYER_HAZARD_INSET
+        return self.rect.inflate(-inset, -inset)
 
     # ------------------------------------------------------------------
     # Placement
@@ -67,6 +80,17 @@ class Player(pygame.sprite.Sprite):
     # ------------------------------------------------------------------
     # Jumping
     # ------------------------------------------------------------------
+
+    def press_jump(self) -> None:
+        """Ask for a jump, tolerating a press that is a frame or two early.
+
+        The request is buffered rather than dropped, so a player who presses
+        just before touching down still jumps on landing.  Landing and jumping
+        again in one motion is the rhythm the climb asks for - most of all on a
+        platform that removes itself - and losing it to a pixel-perfect press
+        is the kind of death the player cannot learn anything from.
+        """
+        self.jump_buffer = JUMP_BUFFER_TIME
 
     def jump(self) -> None:
         """Jump, when grounded or when a mid-air jump is still available.
@@ -109,9 +133,17 @@ class Player(pygame.sprite.Sprite):
         previous_bottom = self.rect.bottom
         self._apply_gravity(dt)
         self._resolve_landing(previous_bottom)
+        self._consume_jump_buffer(dt)
 
         self._collect_fuel()
         self._check_hazards()
+
+    def _consume_jump_buffer(self, dt: float) -> None:
+        """Fire a buffered jump request once there is ground under the player."""
+        self.jump_buffer = max(0.0, self.jump_buffer - dt)
+        if self.jump_buffer > 0.0 and self.on_ground:
+            self.jump_buffer = 0.0
+            self.jump()
 
     def _move_horizontally(self, dt: float, input_manager: InputManager) -> None:
         axis = input_manager.get_movement_axis()
@@ -184,8 +216,9 @@ class Player(pygame.sprite.Sprite):
                 )
 
     def _check_hazards(self) -> None:
+        hitbox = self.hazard_hitbox
         for meteorite in self.world.meteorites:
-            if self.rect.colliderect(meteorite.rect):
+            if hitbox.colliderect(meteorite.hitbox):
                 self.world.end_round()
                 return
         if self.rect.top > self.world.camera.view_bottom():

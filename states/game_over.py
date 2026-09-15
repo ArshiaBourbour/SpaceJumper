@@ -19,8 +19,8 @@ from ui.button import Button
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
     from core.game import Game
 
-_TITLE_CENTER = (SCREEN_WIDTH // 2, 260)
-_STATS_TOP = 330
+_TITLE_CENTER = (SCREEN_WIDTH // 2, 170)
+_STATS_TOP = 230
 _STATS_SPACING = 32
 
 
@@ -29,10 +29,10 @@ class GameOverState(State):
 
     def __init__(self, game: Game) -> None:
         super().__init__(game)
-        self.result = RoundResult(score=0, jumps=0, duration=0.0)
+        self.result = RoundResult()
         self.is_record = False
-        self.play_again_button = Button("Play Again", (SCREEN_WIDTH // 2, 470))
-        self.menu_button = Button("Main Menu", (SCREEN_WIDTH // 2, 540))
+        self.play_again_button = Button("Play Again", (SCREEN_WIDTH // 2, 500))
+        self.menu_button = Button("Main Menu", (SCREEN_WIDTH // 2, 565))
         self._buttons = [self.play_again_button, self.menu_button]
 
     def on_enter(
@@ -78,7 +78,12 @@ class GameOverState(State):
             button.draw(surface, self.game.text, mouse_position)
 
     def _draw_summary(self, surface: pygame.Surface) -> None:
+        # The stage and the altitude are the honest answer to "how did that
+        # go?": they say how far up the difficulty curve this run got, which is
+        # the part the player can actually aim to beat next time.
         lines = [
+            (f"Stage Reached: {self.result.stage}", TEXT_COLOR),
+            (f"Altitude: {int(self.result.altitude)} px", TEXT_COLOR),
             (f"Score: {self.result.score}", TEXT_COLOR),
             (f"Jumps: {self.result.jumps}", TEXT_COLOR),
             (f"Time: {int(self.result.duration)}s", TEXT_COLOR),
