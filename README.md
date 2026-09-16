@@ -31,17 +31,19 @@ Menus are driven with the mouse.
 
 ```text
 space_jumper/
-├── assets/            images, sounds, fonts
-├── config/            constants.py (fixed values), settings.py (preferences)
+├── assets/            art, audio and fonts, organised by the Art Bible
+├── config/            constants.py, settings.py, difficulty.py, asset_catalog.py
 ├── core/              game.py (loop), game_state.py, state_manager.py, world.py
-├── entities/          player, platforms, meteorite, fuel, power-up, stars
-├── managers/          resource_manager, audio_manager, save_manager
+├── entities/          player + player_visual, visuals, platforms, meteorite,
+│                      fuel, power-up, stars
+├── managers/          asset_manager, resource_manager, audio_manager, save_manager
 ├── states/            one class per screen
 ├── systems/           physics.py, input.py, camera.py
-├── ui/                text.py, button.py, hud.py
+├── ui/                text.py, button.py, hud.py, backdrop.py
 ├── utils/             logger.py, helpers.py, platform_factory.py
+├── docs/              ART_BIBLE.md (art direction and asset specification)
 ├── save/              save.json (created on first run, not committed)
-├── tests/             smoke_test.py
+├── tests/             smoke_test.py, playtest.py
 └── main.py
 ```
 
@@ -88,8 +90,33 @@ which keeps the sprite groups bounded however long a run lasts.
 * `World` is the gameplay simulation for one round. It knows nothing about
   menus or the loop; it reports a finished run through `World.is_over` and the
   `RoundResult` handed to the game-over screen.
-* Managers own everything external: files (`ResourceManager`), audio
-  (`AudioManager`) and persistence (`SaveManager`).
+* Managers own everything external: files and art (`ResourceManager`,
+  `AssetManager`), audio (`AudioManager`) and persistence (`SaveManager`).
+
+### Art and assets
+
+The visual direction, the per-object requirements and the asset workflow live
+in [`docs/ART_BIBLE.md`](docs/ART_BIBLE.md); the tree itself is mapped in
+[`assets/README.md`](assets/README.md).
+
+* `config/asset_catalog.py` turns a *name* into a file path: player states,
+  meteorite variants, platform kinds, themes and icons. It is the only place a
+  path or a sprite size is written down.
+* `AssetManager` resolves a name to a ready-to-blit surface, composes the
+  player from its skin's layers, mirrors frames, and generates a look from the
+  palette when art is missing. `ResourceManager` caches every load and every
+  transform, keyed by `(path, size, mirrored, angle)`; everything is loaded
+  once at startup, and the frame loop performs no I/O and no transforms.
+* `entities/player_visual.py` keeps appearance out of the simulation: the
+  player's physics produce a state (`idle`/`jump`/`fall`/`landing`/`hurt`/
+  `death`) and the visual interprets it, animating by elapsed time so the speed
+  is identical at every frame rate.
+* Collision geometry is declared separately from art (`PLAYER_COLLISION_SIZE`,
+  `METEORITE_SIZE`, `FUEL_SIZE`) and sprites are drawn *against* it, anchored
+  on the feet, the hazard's base or the platform's top-left. Restyling or
+  resizing art therefore cannot move a hitbox: the test suite draws the game
+  with deliberately oversized art and checks that every rectangle is
+  unchanged.
 
 ### State flow
 
@@ -136,3 +163,17 @@ the existing gameplay behaviour, plus the Phase 3 guarantees:
 * every generated platform is reachable and no vertical gap exceeds the jump,
 * a round with no input never ends on the opening fall,
 * the camera never moves an entity, and off-screen objects are recycled.
+
+The Phase 4 fairness rules and the Phase 4.5 asset pipeline are checked by the
+same suite: the asset tree, the catalog conventions, every name's resolution,
+animation timing at 30/60/120/144 FPS, the player's visual state machine,
+nothing-loading-while-playing, and that oversized art leaves every collision
+rectangle where it was.
+
+The autopilot playtest reports whether the climb is *fair* rather than merely
+correct (median survival, death causes, unreachable links):
+
+```bash
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python tests/playtest.py --runs 40
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python tests/playtest.py --layout
+```
