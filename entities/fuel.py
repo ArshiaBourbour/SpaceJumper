@@ -1,4 +1,10 @@
-"""Collectible fuel canister entity."""
+"""Collectible fuel canister entity.
+
+A canister is a :data:`~config.constants.FUEL_SIZE` collision box plus the
+collectible art pipeline; the art is anchored on the centre of that box, so a
+canister can be given an idle float or a glow later without changing where it
+can be collected from.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import pygame
 
+from config.asset_catalog import FUEL_ANCHOR, FUEL_FRAME_TIME
 from config.constants import (
     FUEL_HOVER,
     FUEL_SIZE,
@@ -17,6 +24,7 @@ from config.constants import (
     SCREEN_WIDTH,
 )
 from entities.platforms import Platform, RedPlatform
+from entities.visuals import SpriteVisual
 from utils.logger import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
@@ -37,8 +45,26 @@ class Fuel(pygame.sprite.Sprite):
 
     def __init__(self, world: World) -> None:
         super().__init__()
-        self.image: pygame.Surface = world.fuel_img
+        self.visual: SpriteVisual = SpriteVisual(
+            world.assets.fuel_frames(),
+            frame_time=FUEL_FRAME_TIME,
+            loop=True,
+            anchor=FUEL_ANCHOR,
+        )
         self.rect: pygame.Rect = self._find_spawn_rect(world)
+
+    @property
+    def image(self) -> pygame.Surface:
+        """The frame to draw right now."""
+        return self.visual.frame
+
+    def blit_rect(self) -> pygame.Rect:
+        """Return where the sprite is drawn in world coordinates."""
+        return self.visual.blit_rect(self.rect)
+
+    def update(self, dt: float = 0.0) -> None:
+        """Advance the canister's idle animation; collects nothing by itself."""
+        self.visual.update(dt)
 
     @classmethod
     def _find_spawn_rect(cls, world: World) -> pygame.Rect:
