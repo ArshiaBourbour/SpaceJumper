@@ -17,15 +17,14 @@ PROJECT_ROOT: str = os.path.dirname(
 )
 
 ASSETS_DIR: str = os.path.join(PROJECT_ROOT, "assets")
-IMAGES_DIR: str = os.path.join(ASSETS_DIR, "images")
 SOUNDS_DIR: str = os.path.join(ASSETS_DIR, "sounds")
 MUSIC_DIR: str = os.path.join(ASSETS_DIR, "music")
 FONTS_DIR: str = os.path.join(ASSETS_DIR, "fonts")
 SAVE_DIR: str = os.path.join(PROJECT_ROOT, "save")
 
-PLAYER_IMG_PATH: str = os.path.join(IMAGES_DIR, "pl.png")
-FUEL_IMG_PATH: str = os.path.join(IMAGES_DIR, "5998974.PNG")
-METEORITE_IMG_PATH: str = os.path.join(IMAGES_DIR, "meteorite.png")
+#: The asset *tree* is described by :mod:`config.asset_catalog`, which turns a
+#: logical name (a player state, a meteorite variant, a platform kind) into a
+#: file.  Nothing else in the project holds an image path.
 
 JUMP_SOUND_PATH: str = os.path.join(SOUNDS_DIR, "jump.mp3")
 FALL_SOUND_PATH: str = os.path.join(SOUNDS_DIR, "fall.mp3")
@@ -77,13 +76,28 @@ ALTITUDE_BAR_BG_COLOR: tuple[int, int, int] = (255, 255, 255)
 ALTITUDE_BAR_FILL_COLOR: tuple[int, int, int] = (0, 200, 255)
 
 # ---------------------------------------------------------------------------
-# Sprite sizes
+# Sprite and collision sizes
 # ---------------------------------------------------------------------------
+# Collision geometry is declared separately from the art that is drawn on top
+# of it, and that separation is deliberate: a future skin, a bigger meteorite
+# sprite or an animated frame must never resize a hitbox.  The two values are
+# equal today, so the current gameplay is byte-for-byte what it was.
 PLAYER_SIZE: tuple[int, int] = (50, 50)
+#: The rectangle the player physics and collisions use.
+PLAYER_COLLISION_SIZE: tuple[int, int] = PLAYER_SIZE
 FUEL_SIZE: tuple[int, int] = (30, 30)
+#: The rectangle a meteorite's collision uses, whatever variant it draws.
 METEORITE_SIZE: tuple[int, int] = (40, 40)
 PLATFORM_SIZE: tuple[int, int] = (100, 20)
 POWERUP_SIZE: tuple[int, int] = (25, 25)
+
+#: Power-up palette.  Colour is how a power-up communicates its kind, so the
+#: same body can be reused for every kind without a label.
+POWERUP_COLORS: dict[str, tuple[int, int, int]] = {
+    "slow": (0, 255, 255),
+    "double": (255, 255, 0),
+    "super": (255, 0, 255),
+}
 
 # ---------------------------------------------------------------------------
 # World / gameplay tuning
