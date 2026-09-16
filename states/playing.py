@@ -40,6 +40,7 @@ class PlayingState(State):
             audio=self.game.audio,
             starfield=self.game.starfield,
             username=self.game.username,
+            assets=self.game.assets,
         )
         self._score_committed = False
         self.game.audio.play_music("gameplay")
