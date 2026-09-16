@@ -14,6 +14,13 @@ One frame runs in a fixed order::
 
 so collisions always use the positions the player can actually see.
 
+Art is not held here either.  The world asks the
+:class:`~managers.asset_manager.AssetManager` for the look of the round (the
+player's frames, the canisters, the platforms) and for the **theme** it is
+dressed in; it never names a file.  Restyling the game is a change to the asset
+catalog, and swapping a sprite's size is measured against the collision
+rectangles the entities keep, which do not move.
+
 How hard the climb is comes from :mod:`config.difficulty`, which scales gaps,
 platform widths, the platform mix, the hazard count and the reach a jump may
 demand with the player's altitude.  The world reports which stage the player is
@@ -28,11 +35,9 @@ from typing import TYPE_CHECKING
 
 import pygame
 
+from config.asset_catalog import DEFAULT_THEME, theme_spec
 from config.constants import (
-    BG_COLOR,
     FUEL_CONSUMPTION_RATE,
-    FUEL_IMG_PATH,
-    FUEL_SIZE,
     FUEL_START,
     INITIAL_CLIMB_HEIGHT,
     INITIAL_PLATFORM_LIMIT,
@@ -40,7 +45,6 @@ from config.constants import (
     MIN_FUEL_CANISTERS,
     PLATFORM_CULL_MARGIN,
     PLATFORM_SPAWN_HEADROOM,
-    PLAYER_IMG_PATH,
     PLAYER_SIZE,
     POWERUP_KINDS,
     POWERUP_SPAWN_CHANCE,
@@ -55,9 +59,11 @@ from config.difficulty import DifficultyTier, climb_altitude, tier_at
 from entities import Fuel, Meteorite, Player, PowerUp
 from entities.platforms import Platform
 from entities.star import Starfield
+from managers.asset_manager import AssetManager
 from managers.audio_manager import AudioManager
 from managers.resource_manager import ResourceManager
 from systems.camera import Camera
+from ui.backdrop import draw_backdrop
 from utils.platform_factory import ClimbGenerator
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
@@ -85,21 +91,23 @@ class World:
         audio: AudioManager,
         starfield: Starfield,
         username: str,
+        assets: AssetManager | None = None,
+        theme: str | None = None,
     ) -> None:
         self.resources = resources
         self.audio = audio
         self.starfield = starfield
         self.username = username
-
-        self.player_img: pygame.Surface = resources.load_image(
-            PLAYER_IMG_PATH, PLAYER_SIZE
-        )
-        self.fuel_img: pygame.Surface = resources.load_image(
-            FUEL_IMG_PATH, FUEL_SIZE
-        )
+        #: Everything this round draws comes from here.  A caller that does not
+        #: supply one gets a manager over its own resource cache, so the two
+        #: caches are never mixed.
+        self.assets: AssetManager = assets or AssetManager(resources)
+        #: The world's dress: backdrop art, backdrop colour, star tint.  A
+        #: theme is data, so a new world is a catalog entry, not a code path.
+        self.theme = theme_spec(theme or self.assets.theme_name)
 
         self.camera = Camera()
-        self.climb = ClimbGenerator()
+        self.climb = ClimbGenerator(self.assets)
         self.platforms = pygame.sprite.Group()
         self.fuels = pygame.sprite.Group()
         self.powerups = pygame.sprite.Group()
@@ -141,7 +149,10 @@ class World:
         self.meteorites.empty()
 
         pad = Platform(
-            self.player.rect.centerx, SCREEN_HEIGHT, START_PLATFORM_SIZE
+            self.player.rect.centerx,
+            SCREEN_HEIGHT,
+            START_PLATFORM_SIZE,
+            assets=self.assets,
         )
         self.platforms.add(pad)
         self.climb.reset(pad)
@@ -183,6 +194,7 @@ class World:
         if self.is_over:
             return
         self.is_over = True
+        self.player.on_death()
         self.audio.play_sfx("fall")
 
     # ------------------------------------------------------------------
@@ -201,6 +213,10 @@ class World:
         self.platforms.update(dt)
         self.meteorites.update(dt)
         self.player.update(dt, input_manager)
+        # Pickups only advance their idle animation; they move nothing and
+        # collect nothing until the player touches them.
+        self.fuels.update(dt)
+        self.powerups.update(dt)
 
         self._collect_powerups()
         self._update_slow_motion(dt)
@@ -246,6 +262,7 @@ class World:
                 platform.rect.centerx,
                 platform.rect.centery - POWERUP_SPAWN_OFFSET,
                 random.choice(POWERUP_KINDS),
+                assets=self.assets,
             )
         )
 
@@ -323,9 +340,11 @@ class World:
 
     def draw(self, surface: pygame.Surface) -> None:
         """Render the background, entities and player in screen space."""
-        surface.fill(BG_COLOR)
-        self.starfield.draw(surface)
+        draw_backdrop(surface, self.assets, self.starfield, self.theme)
 
+        # Sprites are placed by their own anchor - a meteorite by its base, the
+        # player by its feet - so the art can be any size without moving the
+        # collision rectangle it is drawn against.
         offset = round(self.camera.offset_y)
         for group in (
             self.platforms,
@@ -334,9 +353,9 @@ class World:
             self.meteorites,
         ):
             for sprite in group:
-                screen_rect = sprite.rect.move(0, offset)
+                screen_rect = sprite.blit_rect().move(0, offset)
                 if screen_rect.bottom < 0 or screen_rect.top > SCREEN_HEIGHT:
                     continue
                 surface.blit(sprite.image, screen_rect)
 
-        surface.blit(self.player.image, self.player.rect.move(0, offset))
+        surface.blit(self.player.image, self.player.blit_rect().move(0, offset))
