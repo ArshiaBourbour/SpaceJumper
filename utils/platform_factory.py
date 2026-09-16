@@ -22,6 +22,7 @@ Three rules turn "possible" into "fair":
 from __future__ import annotations
 
 import random
+from typing import TYPE_CHECKING
 
 from config.constants import PLATFORM_SIZE, PLATFORM_SPAWN_MARGIN, SCREEN_WIDTH
 from config.difficulty import (
@@ -40,7 +41,12 @@ from config.difficulty import (
 from entities.platforms import BluePlatform, Platform, RedPlatform
 from systems import physics
 
-#: Platform type names, as used by the difficulty tiers.
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
+    from managers.asset_manager import AssetManager
+
+#: Platform type names, as used by the difficulty tiers.  Each type maps to the
+#: look its class asks the asset catalog for, so the mix a stage may draw and
+#: the way a platform is drawn stay independent decisions.
 NORMAL, BLUE, RED = "normal", "blue", "red"
 
 
@@ -51,13 +57,15 @@ def generate_platform(
     width: int = PLATFORM_SIZE[0],
     kind: str = NORMAL,
     patrol: float = 0.0,
+    assets: AssetManager | None = None,
 ) -> Platform:
     """Create a platform of the requested *kind*, *width* and patrol range."""
+    size = (width, PLATFORM_SIZE[1])
     if kind == BLUE:
-        return BluePlatform(x, y, (width, PLATFORM_SIZE[1]), patrol)
+        return BluePlatform(x, y, size, patrol, assets=assets)
     if kind == RED:
-        return RedPlatform(x, y, (width, PLATFORM_SIZE[1]))
-    return Platform(x, y, (width, PLATFORM_SIZE[1]))
+        return RedPlatform(x, y, size, assets=assets)
+    return Platform(x, y, size, assets=assets)
 
 
 def pick_kind(tier: DifficultyTier) -> str:
@@ -75,7 +83,10 @@ class ClimbGenerator:
     turned out to be and how long it has been since the player got an easy one.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, assets: AssetManager | None = None) -> None:
+        #: The asset manager every platform this generator builds is drawn
+        #: with, so art is looked up in one place rather than per class.
+        self.assets: AssetManager | None = assets
         self.anchor: Platform | None = None
         #: What the last link actually asked for, as a share of the envelope.
         #: The next link is planned from this, so the climb's difficulty grows
@@ -105,7 +116,7 @@ class ClimbGenerator:
         """
         anchor = self.anchor
         if anchor is None:  # pragma: no cover - reset() is always called first
-            return Platform(SCREEN_WIDTH / 2, 0.0)
+            return Platform(SCREEN_WIDTH / 2, 0.0, assets=self.assets)
 
         tier = tier_at(climb_altitude(anchor.rect.centery))
         breather = self._breather_due()
@@ -129,6 +140,7 @@ class ClimbGenerator:
             width=width,
             kind=kind,
             patrol=tier.patrol,
+            assets=self.assets,
         )
 
         self.anchor = platform
