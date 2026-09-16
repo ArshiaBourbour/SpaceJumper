@@ -1,4 +1,11 @@
-"""Falling meteorite hazard entity."""
+"""Falling meteorite hazard entity.
+
+The rock the player dodges is a collision rectangle of
+:data:`~config.constants.METEORITE_SIZE`; the picture drawn on it comes from
+the meteorite variant pipeline (:func:`entities.visuals.meteor_visual`).  The
+two are separate on purpose: a larger or burning variant is a drop-in art set,
+not a different hazard, because nothing about the hitbox depends on the sprite.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +14,10 @@ from typing import TYPE_CHECKING
 
 import pygame
 
+from config.asset_catalog import DEFAULT_METEOR_VARIANT
 from config.constants import (
     METEORITE_FALL_SPEED,
     METEORITE_HITBOX_INSET,
-    METEORITE_IMG_PATH,
     METEORITE_RESPAWN_DELAY_MAX,
     METEORITE_RESPAWN_DELAY_MIN,
     METEORITE_SIZE,
@@ -19,6 +26,7 @@ from config.constants import (
     METEORITE_SPAWN_CLEARANCE,
     SCREEN_WIDTH,
 )
+from entities.visuals import meteor_visual
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
     from core.world import World
@@ -42,20 +50,28 @@ class Meteorite(pygame.sprite.Sprite):
     screen and never appears inside the view already falling.
     """
 
-    def __init__(self, world: World) -> None:
+    def __init__(
+        self, world: World, variant: str = DEFAULT_METEOR_VARIANT
+    ) -> None:
         super().__init__()
         self.world: World = world
-        # Sprites share the cached surface, so they must never draw onto it.
-        self.image: pygame.Surface = world.resources.load_image(
-            METEORITE_IMG_PATH, METEORITE_SIZE
-        )
-        self.rect: pygame.Rect = self.image.get_rect()
+        #: Visual variant.  Every variant shares one collision footprint, so
+        #: this selects art and nothing else.
+        self.variant: str = variant
+        # Sprites share the cached surfaces, so they must never draw onto them.
+        self.visual = meteor_visual(world.assets, variant)
+        self.rect: pygame.Rect = pygame.Rect((0, 0), METEORITE_SIZE)
         self.position_x: float = 0.0
         self.position_y: float = 0.0
         self.speed: float = METEORITE_FALL_SPEED
         self.enter_offset: float = 0.0
         self.wait: float = 0.0
         self.respawn()
+
+    @property
+    def image(self) -> pygame.Surface:
+        """The frame to draw right now."""
+        return self.visual.frame
 
     @property
     def hitbox(self) -> pygame.Rect:
@@ -65,6 +81,14 @@ class Meteorite(pygame.sprite.Sprite):
         """
         inset = 2 * METEORITE_HITBOX_INSET
         return self.rect.inflate(-inset, -inset)
+
+    def blit_rect(self) -> pygame.Rect:
+        """Return where the sprite is drawn in world coordinates.
+
+        Anchored on the bottom centre of the hitbox, so a variant with larger
+        art grows upwards and a player can still read the rock's landing spot.
+        """
+        return self.visual.blit_rect(self.rect)
 
     def respawn(self) -> None:
         """Take the meteorite out of play above the view, then wait a beat."""
@@ -84,6 +108,7 @@ class Meteorite(pygame.sprite.Sprite):
             self._hold_above_view()
             return
         self.position_y += self.speed * dt
+        self.visual.update(dt)
         self._sync_rect()
         if self.rect.top > self.world.camera.view_bottom():
             self.respawn()
