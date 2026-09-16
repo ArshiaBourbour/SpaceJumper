@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import pygame
 
-from config.constants import BG_COLOR
+from config.asset_catalog import DEFAULT_THEME
 from config.settings import Settings
 from core.game_state import GameState
 from core.state_manager import StateManager
 from entities.star import Starfield
+from managers.asset_manager import AssetManager, use_asset_manager
 from managers.audio_manager import AudioManager
 from managers.resource_manager import ResourceManager
 from managers.save_manager import SaveManager
@@ -28,6 +29,7 @@ from states import (
     SettingsState,
 )
 from systems.input import InputManager
+from ui.backdrop import draw_backdrop
 from ui.text import TextRenderer
 from utils.logger import configure_logging, get_logger
 
@@ -57,11 +59,15 @@ class Game:
         self.clock: pygame.time.Clock = pygame.time.Clock()
 
         self.resources = ResourceManager()
+        #: Every drawn asset comes from here, and the first thing the game does
+        #: is load them all: after this point no frame ever touches the disk.
+        self.assets = use_asset_manager(AssetManager(self.resources, DEFAULT_THEME))
+        self.assets.preload()
         self.audio = AudioManager(self.settings, self.resources)
         self.audio.initialize()
         self.input = InputManager()
         self.text = TextRenderer(self.resources)
-        self.starfield = Starfield()
+        self.starfield = Starfield(color=self.assets.theme.star_color)
         self.fps: float = 0.0
 
         self.username: str = self.saves.data.last_username
@@ -97,9 +103,8 @@ class Game:
         logger.info("player name set to %r", username)
 
     def draw_background(self, surface: pygame.Surface) -> None:
-        """Paint the shared starfield backdrop used by the menu screens."""
-        surface.fill(BG_COLOR)
-        self.starfield.draw(surface)
+        """Paint the shared backdrop used by the non-gameplay screens."""
+        draw_backdrop(surface, self.assets, self.starfield)
 
     # ------------------------------------------------------------------
     # Main loop
