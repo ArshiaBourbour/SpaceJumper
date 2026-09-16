@@ -9,11 +9,19 @@ Sizes are chosen per stage of the climb rather than fixed (see
 :mod:`config.difficulty`), so a platform carries its own width from the moment
 it is generated - and a moving platform carries its own patrol range too, which
 is what keeps it a platform the player can actually plan around.
+
+A platform's *look* is requested by name from the asset pipeline rather than
+painted here: each class declares the ``look`` it wants (``normal``,
+``moving``, ``fragile``) and the platform is drawn at exactly the size of its
+collision rectangle.  That last part matters - because the picture and the
+rectangle are the same size by construction, a platform can be restyled
+without any chance of nudging what the player stands on.
 """
 
 from __future__ import annotations
 
 import random
+from typing import TYPE_CHECKING
 
 import pygame
 
@@ -24,22 +32,35 @@ from config.constants import (
     RED_PLATFORM_TIMER_MIN,
     SCREEN_WIDTH,
 )
+from entities.visuals import resolve_assets
 
-NORMAL_COLOR = (200, 200, 200)
-MOVING_COLOR = (100, 100, 255)
-FRAGILE_COLOR = (255, 80, 80)
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
+    from managers.asset_manager import AssetManager
 
 
 class Platform(pygame.sprite.Sprite):
     """A standard static platform the player can land on."""
 
+    #: Which look from the asset catalog this platform is drawn with.
+    look: str = "normal"
+
     def __init__(
-        self, x: float, y: float, size: tuple[int, int] = PLATFORM_SIZE
+        self,
+        x: float,
+        y: float,
+        size: tuple[int, int] = PLATFORM_SIZE,
+        *,
+        assets: AssetManager | None = None,
     ) -> None:
         super().__init__()
-        self.image: pygame.Surface = pygame.Surface(size)
-        self.image.fill(NORMAL_COLOR)
+        self.image: pygame.Surface = resolve_assets(assets).platform_surface(
+            self.look, size
+        )
         self.rect: pygame.Rect = self.image.get_rect(center=(x, y))
+
+    def blit_rect(self) -> pygame.Rect:
+        """Return where the sprite is drawn in world coordinates."""
+        return self.rect.copy()
 
     def update(self, dt: float = 0.0) -> None:
         """Static platforms do nothing, but keep the group's call signature."""
@@ -54,15 +75,18 @@ class BluePlatform(Platform):
     be in when planning the next platform.
     """
 
+    look = "moving"
+
     def __init__(
         self,
         x: float,
         y: float,
         size: tuple[int, int] = PLATFORM_SIZE,
         patrol: float = 0.0,
+        *,
+        assets: AssetManager | None = None,
     ) -> None:
-        super().__init__(x, y, size)
-        self.image.fill(MOVING_COLOR)
+        super().__init__(x, y, size, assets=assets)
         self.speed: float = PLATFORM_MOVE_SPEED
         self.direction: int = 1
         self.position_x: float = float(self.rect.x)
@@ -87,11 +111,17 @@ class BluePlatform(Platform):
 class RedPlatform(Platform):
     """A platform that disappears shortly after the player lands on it."""
 
+    look = "fragile"
+
     def __init__(
-        self, x: float, y: float, size: tuple[int, int] = PLATFORM_SIZE
+        self,
+        x: float,
+        y: float,
+        size: tuple[int, int] = PLATFORM_SIZE,
+        *,
+        assets: AssetManager | None = None,
     ) -> None:
-        super().__init__(x, y, size)
-        self.image.fill(FRAGILE_COLOR)
+        super().__init__(x, y, size, assets=assets)
         self.timer: float = random.uniform(
             RED_PLATFORM_TIMER_MIN, RED_PLATFORM_TIMER_MAX
         )
