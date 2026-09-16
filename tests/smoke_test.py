@@ -1,14 +1,20 @@
-"""Headless regression suite for Space Jumper (Phases 2 and 3).
+"""Headless regression suite for Space Jumper (Phases 2 to 4.5).
 
 Run it with a dummy SDL driver so no window or speakers are needed::
 
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python tests/smoke_test.py
 
 It checks the systems Phase 2 introduced (states, resources, audio, saves,
-input, configuration) and the gameplay guarantees Phase 3 established: frame
-rate independence, reliable collision, reachable platform generation, camera
-and world coordinates staying apart, and recycling of what the camera leaves
-behind.
+input, configuration), the gameplay guarantees Phase 3 established (frame rate
+independence, reliable collision, reachable platform generation, camera and
+world coordinates staying apart, recycling of what the camera leaves behind)
+and the Phase 4 fairness rules (difficulty curve, pacing, hazards, hitboxes,
+fuel, jump buffering).
+
+Phase 4.5 adds the asset-pipeline checks: the tree on disk, the catalog's
+naming conventions, the resolution of every named asset, the player's visual
+state machine, and - the one that matters most - that art can change size
+without moving a single collision rectangle.
 """
 
 from __future__ import annotations
@@ -24,17 +30,38 @@ import pygame
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from config.asset_catalog import (  # noqa: E402
+    ASSET_DIRS,
+    Anchor,
+    DEFAULT_METEOR_VARIANT,
+    DEFAULT_SKIN_PARTS,
+    DEFAULT_THEME,
+    METEOR_VARIANTS,
+    PLAYER_ANCHOR,
+    PLATFORM_LOOKS,
+    PLAYER_CLIPS,
+    PLAYER_PARTS,
+    fuel_frame_path,
+    meteor_frame_path,
+    player_frame_path,
+    theme_spec,
+)
 from config.constants import (  # noqa: E402
     CAMERA_DEAD_ZONE,
     FUEL_HOVER,
     FUEL_MAX,
+    FUEL_SIZE,
     JUMP_VELOCITY,
     MAX_FALL_SPEED,
+    METEORITE_SIZE,
     MIN_FUEL_CANISTERS,
     METEORITE_SPAWN_CLEARANCE,
     PLATFORM_CULL_MARGIN,
     PLATFORM_MOVE_SPEED,
+    PLAYER_COLLISION_SIZE,
     PLAYER_HAZARD_INSET,
+    PLAYER_SIZE,
+    POWERUP_SIZE,
     SCREEN_HEIGHT,
     SCREEN_WIDTH,
     START_PLATFORM_SIZE,
@@ -57,6 +84,17 @@ from core.world import World  # noqa: E402
 from entities import Fuel, Player  # noqa: E402
 from entities.meteorite import Meteorite  # noqa: E402
 from entities.platforms import BluePlatform, Platform, RedPlatform  # noqa: E402
+from entities.player_visual import (  # noqa: E402
+    DEFAULT_SKIN,
+    SKINS,
+    PlayerSkin,
+    PlayerVisual,
+    PlayerVisualState,
+)
+from entities.star import Starfield  # noqa: E402
+from entities.visuals import FrameSet, SpriteVisual, meteor_visual  # noqa: E402
+from managers.asset_manager import ART, AssetManager  # noqa: E402
+from managers.audio_manager import AudioManager  # noqa: E402
 from managers.resource_manager import ResourceManager  # noqa: E402
 from managers.save_manager import SaveManager  # noqa: E402
 from states.playing import PlayingState  # noqa: E402
@@ -151,13 +189,36 @@ class Harness:
 def test_resources() -> None:
     section("Resource manager")
     resources = ResourceManager()
-    first = resources.load_image("assets/images/pl.png", (50, 50))
-    second = resources.load_image("assets/images/pl.png", (50, 50))
+    player_art = player_frame_path("idle")
+    check(resources.image_available(player_art), "the player art is on disk")
+    first = resources.load_image(player_art, (50, 50))
+    second = resources.load_image(player_art, (50, 50))
     check(first is second, "images are cached, not reloaded")
     check(first.get_size() == (50, 50), "images are scaled to the requested size")
+    coverage = [
+        first.get_at((x, y))[3] for x in range(0, 50, 5) for y in range(0, 50, 5)
+    ]
+    check(
+        max(coverage) > 0 and min(coverage) < 255,
+        "the player sprite is art with a transparent background, not a placeholder",
+    )
     check(
         resources.load_image("assets/images/missing.png").get_size() == (32, 32),
         "missing images fall back to a placeholder",
+    )
+    check(
+        resources.load_image_or_none("assets/images/missing.png") is None,
+        "a caller can ask for art without getting a placeholder",
+    )
+    check(
+        resources.load_image(player_art, (50, 50), flipped=True)
+        is not first,
+        "a mirrored image is a separate cached surface",
+    )
+    check(
+        resources.load_image(player_art, (50, 50), flipped=True)
+        is resources.load_image(player_art, (50, 50), flipped=True),
+        "mirrored images are cached too, so turning around is free",
     )
     check(resources.load_font(24) is resources.load_font(24), "fonts are cached")
     check(
@@ -173,7 +234,7 @@ def test_resources() -> None:
     )
     resources.clear_cache()
     check(
-        resources.load_image("assets/images/pl.png") is not first,
+        resources.load_image(player_art) is not first,
         "clear_cache drops cached resources",
     )
 
@@ -1666,6 +1727,515 @@ def test_pause_during_jump() -> None:
         harness.close()
 
 
+# ---------------------------------------------------------------------------
+# Phase 4.5 - the asset pipeline
+# ---------------------------------------------------------------------------
+
+
+class OversizedAssets(AssetManager):
+    """A manager that hands out art far larger than the gameplay size.
+
+    Stands in for a future skin or a bigger sprite: if a collision rectangle
+    can be moved by art, this is what moves it.
+    """
+
+    def player_frames(self, state, *, parts=None, facing=1):  # noqa: D102
+        size = (PLAYER_COLLISION_SIZE[0] * 3, PLAYER_COLLISION_SIZE[1] * 2)
+        return (pygame.Surface(size, pygame.SRCALPHA),)
+
+    def meteor_frame(self, variant=DEFAULT_METEOR_VARIANT, *, index=1, angle=0.0):  # noqa: D102
+        return pygame.Surface((METEORITE_SIZE[0] * 2, METEORITE_SIZE[1] * 2), pygame.SRCALPHA)
+
+
+class NoArtAssets(AssetManager):
+    """A manager that can find no artwork at all on disk."""
+
+    def __init__(self) -> None:
+        super().__init__(ResourceManager())
+
+        def _never(path, size=None, *, flipped=False, angle=0.0):
+            return None
+
+        self.resources.load_image_or_none = _never  # type: ignore[method-assign]
+
+
+def _bare_world(assets: AssetManager | None = None) -> World:
+    """Build a world on its own, sharing nothing with the running game."""
+    resources = ResourceManager()
+    return World(
+        resources=resources,
+        audio=AudioManager(Settings(), resources),
+        starfield=Starfield(),
+        username="assets",
+        assets=assets,
+    )
+
+
+def test_asset_tree() -> None:
+    section("Assets: the tree on disk")
+    shipped = {
+        "the player's first idle frame": player_frame_path("idle"),
+        "the medium meteorite": meteor_frame_path(DEFAULT_METEOR_VARIANT),
+        "the fuel canister": fuel_frame_path(1),
+    }
+    for label, path in shipped.items():
+        check(os.path.isfile(path), f"{label} is exactly where the catalog says it is")
+
+    check(
+        all(os.path.isdir(path) for path in ASSET_DIRS),
+        "every directory the pipeline expects exists",
+    )
+    check(
+        not os.path.isdir("assets/images"),
+        "the old flat assets/images folder is gone",
+    )
+    check(
+        player_frame_path("jump", part="suit", variant="cyber").endswith(
+            os.path.join("assets", "player", "suits", "cyber", "suit_jump_01.png")
+        ),
+        "a suit frame resolves into its variant folder",
+    )
+    check(
+        PLAYER_ANCHOR.name == "BOTTOM_CENTER",
+        "player sprites anchor on their feet",
+    )
+    check(
+        set(PLAYER_CLIPS) == {state.value for state in PlayerVisualState},
+        "every visual state has a clip defined",
+    )
+    check(
+        set(DEFAULT_SKIN_PARTS) == {part.name for part in PLAYER_PARTS},
+        "the default skin declares every character layer the pipeline knows",
+    )
+
+
+def test_asset_manager() -> None:
+    section("Assets: the manager resolves names")
+    resources = ResourceManager()
+    assets = AssetManager(resources)
+
+    frames = assets.player_frames("idle")
+    check(len(frames) == 1, f"the idle clip has frames to draw ({len(frames)})")
+    check(
+        assets.player_frames("idle") is frames,
+        "a clip is composed once and handed out from the cache",
+    )
+    check(
+        pygame.image.tostring(assets.player_frame("jump"), "RGBA")
+        == pygame.image.tostring(assets.player_frame("idle"), "RGBA"),
+        "a state with no art of its own is drawn exactly like its fallback",
+    )
+    check(
+        assets.resolution_of("player.base.jump") == "fallback",
+        "the audit records which poses still need their own art",
+    )
+    check(
+        assets.player_frame("idle", facing=-1) is not assets.player_frame("idle"),
+        "facing left is a different picture",
+    )
+    check(
+        assets.player_frame("idle", facing=-1) is assets.player_frame("idle", facing=-1),
+        "the mirrored picture is cached, not rebuilt per frame",
+    )
+    check(
+        assets.resolution_of("player.base.idle") == ART,
+        "the shipped player art resolves as real art, not a placeholder",
+    )
+    check(
+        assets.player_frame("idle").get_size() == PLAYER_SIZE,
+        f"the player sprite is drawn at its gameplay size {PLAYER_SIZE}",
+    )
+
+    for variant, spec in METEOR_VARIANTS.items():
+        frame = assets.meteor_frame(variant)
+        check(
+            frame.get_size() == spec.sprite_size,
+            f"the {variant} meteorite draws at its own size {spec.sprite_size}",
+        )
+    check(
+        assets.meteor_frame("large") is not assets.meteor_frame("medium"),
+        "meteorite variants are different pictures",
+    )
+    check(
+        assets.resolution_of("meteor.large.1") == "fallback",
+        "a variant with no art of its own borrows the medium rock",
+    )
+
+    normal = assets.platform_surface("normal", (100, 20))
+    check(
+        normal.get_size() == (100, 20),
+        "a platform is drawn at exactly the size it collides at",
+    )
+    check(
+        assets.platform_surface("normal", (100, 20)) is normal,
+        "a platform look is generated once per (kind, size)",
+    )
+    check(
+        assets.platform_surface("normal", (140, 20)).get_size() == (140, 20),
+        "a wider platform gets its own surface",
+    )
+    check(
+        assets.platform_surface("fragile", (100, 20)) is not normal
+        and assets.platform_surface("moving", (100, 20)) is not normal,
+        "each platform kind has its own look",
+    )
+    check(
+        assets.platform_surface("normal", (100, 20)).get_at((50, 2))[3] > 0,
+        "generated platform art is solid where the player stands",
+    )
+
+    check(
+        assets.background(DEFAULT_THEME) is None,
+        "the space theme has no backdrop file and paints its colour instead",
+    )
+    check(
+        assets.theme.name == theme_spec(DEFAULT_THEME).name
+        and assets.theme.bg_color == theme_spec(DEFAULT_THEME).bg_color,
+        "a world falls back to the default theme",
+    )
+    check(
+        theme_spec("mars").bg_color != theme_spec("space").bg_color,
+        "a theme can change the backdrop without touching gameplay",
+    )
+    check(
+        assets.icon("fuel") is None and assets.icon("nope") is None,
+        "an icon that has not been drawn yet is None rather than a placeholder",
+    )
+
+    check(
+        assets.fuel_frames()[0].get_size() == FUEL_SIZE,
+        "the fuel canister draws at its gameplay size",
+    )
+    check(
+        assets.powerup_frames("super")[0].get_size() == POWERUP_SIZE,
+        "a power-up without art is generated at its gameplay size",
+    )
+
+
+def test_asset_manager_never_crashes_without_art() -> None:
+    section("Assets: placeholders and no art at all")
+    assets = NoArtAssets()
+    check(
+        assets.player_frames("idle")[0].get_size() == PLAYER_SIZE,
+        "a missing player frame still yields a drawable surface",
+    )
+    check(
+        assets.meteor_frame("medium").get_width() > 0,
+        "a missing meteorite is generated instead of raising",
+    )
+    check(
+        assets.platform_surface("normal", (90, 20)).get_size() == (90, 20),
+        "a platform is generated when no art exists at all",
+    )
+    check(
+        "generated" in " ".join(assets.borrowed_assets()),
+        "the manager reports which assets are not real art yet",
+    )
+
+
+def test_player_visual_architecture() -> None:
+    section("Assets: the player's visual architecture")
+    assets = AssetManager(ResourceManager())
+    visual = PlayerVisual(assets)
+
+    for state in PlayerVisualState:
+        visual.set_state(state)
+        visual.update(0.2)
+        check(
+            visual.frame.get_size() == PLAYER_SIZE,
+            f"the {state.value} pose can be drawn",
+        )
+
+    visual.set_state(PlayerVisualState.IDLE)
+    check(not visual.flipped, "the player starts facing right")
+    visual.set_facing(-1)
+    check(visual.flipped, "facing follows the movement axis")
+    visual.set_facing(0)
+    check(visual.flipped, "releasing the keys does not turn the player around")
+
+    visual.set_state(PlayerVisualState.JUMP)
+    visual.update(0.1)
+    held = visual.elapsed
+    visual.set_state(PlayerVisualState.JUMP)
+    check(
+        visual.elapsed == held,
+        "re-setting the same pose does not restart the clip",
+    )
+    visual.set_state(PlayerVisualState.FALL)
+    check(visual.elapsed == 0.0, "changing pose restarts the clip")
+
+    check(len(SKINS) >= 1 and SKINS["default"] is DEFAULT_SKIN, "skins are registered by name")
+    check(
+        DEFAULT_SKIN.variant("suit") == "default" and DEFAULT_SKIN.with_part("suit", "cyber").variant("suit") == "cyber",
+        "a skin can name a variant without mutating the shared default",
+    )
+    check(
+        DEFAULT_SKIN.variant("suit") == "default",
+        "building a variant skin leaves the default skin alone",
+    )
+
+    layered_frames = assets.player_frames(
+        "idle", parts={"base": "default", "helmet": "default"}
+    )
+    check(
+        layered_frames[0].get_size() == PLAYER_SIZE,
+        "a skin with an extra layer that has no art still composes cleanly",
+    )
+    check(
+        layered_frames is assets.player_frames(
+            "idle", parts={"helmet": "default", "base": "default"}
+        ),
+        "the layer plan is what a composed clip is cached under, not its order",
+    )
+
+
+def test_animation_is_frame_rate_independent() -> None:
+    section("Assets: animation timing")
+    frames = tuple(pygame.Surface((4, 4)) for _ in range(6))
+    clip = FrameSet(frames, frame_time=0.2, loop=True)
+    check(clip.frame_at(0.0) is frames[0], "the first frame plays first")
+    check(clip.frame_at(0.21) is frames[1], "time picks the frame, not a counter")
+    check(clip.frame_at(1.05) is frames[5], "the clip advances with elapsed time")
+    check(clip.frame_at(1.25) is frames[0], "a looping clip wraps around")
+    holding = FrameSet(frames, frame_time=0.2, loop=False)
+    check(
+        holding.frame_at(9.0) is frames[5],
+        "a non-looping clip holds its last frame instead of wrapping",
+    )
+    check(
+        FrameSet((frames[0],), frame_time=0.0).frame_at(42.0) is frames[0],
+        "a single-frame clip ignores time entirely",
+    )
+
+    drawn_at_one_second: dict[str, int] = {}
+    for name, dt in FRAME_RATES.items():
+        visual = SpriteVisual(frames, frame_time=0.2, loop=True)
+        for _ in range(int(round(1.0 / dt))):
+            visual.update(dt)
+        drawn_at_one_second[name] = id(visual.frame)
+        check(
+            abs(visual.elapsed - 1.0) < 1e-6,
+            f"{name}: one second of animation is one second",
+        )
+    check(
+        len(set(drawn_at_one_second.values())) == 1,
+        "every frame rate draws the same frame after the same elapsed time",
+    )
+
+
+def test_art_never_moves_the_body() -> None:
+    section("Assets: art never moves the body")
+    plain = _bare_world()
+    huge = _bare_world(OversizedAssets())
+
+    check(
+        plain.player.rect.size == PLAYER_COLLISION_SIZE
+        and huge.player.rect.size == PLAYER_COLLISION_SIZE,
+        f"the player's collision box is {PLAYER_COLLISION_SIZE} whatever the art",
+    )
+    huge_rect = huge.player.blit_rect()
+    check(
+        huge_rect.size == (PLAYER_COLLISION_SIZE[0] * 3, PLAYER_COLLISION_SIZE[1] * 2),
+        f"oversized art is drawn at its own size ({huge_rect.size})",
+    )
+    check(
+        huge_rect.midbottom == huge.player.rect.midbottom,
+        "oversized art stays anchored on the player's feet",
+    )
+    check(
+        plain.player.blit_rect() == plain.player.rect,
+        "the shipped art draws exactly on its collision box",
+    )
+    check(
+        huge.player.hazard_hitbox.size == plain.player.hazard_hitbox.size,
+        "a bigger sprite does not enlarge the hazard hitbox",
+    )
+
+    plain_meteor = Meteorite(plain)
+    huge_meteor = Meteorite(huge)
+    check(
+        plain_meteor.rect.size == huge_meteor.rect.size == METEORITE_SIZE,
+        f"every meteorite variant collides as {METEORITE_SIZE}",
+    )
+    check(
+        huge_meteor.blit_rect().midbottom == huge_meteor.rect.midbottom,
+        "oversized meteorite art grows upwards from the hitbox",
+    )
+    check(
+        huge_meteor.speed == plain_meteor.speed,
+        "art size does not change how fast a hazard falls",
+    )
+    plain_assets = AssetManager(ResourceManager())
+    for variant, spec in METEOR_VARIANTS.items():
+        visual = meteor_visual(plain_assets, variant)
+        check(
+            visual.frame.get_size() == spec.sprite_size
+            and visual.set.anchor is Anchor.BOTTOM_CENTER,
+            f"the {variant} meteorite draws at {spec.sprite_size} from its base",
+        )
+
+    canister = Fuel(plain)
+    check(
+        canister.rect.size == FUEL_SIZE and canister.blit_rect().center == canister.rect.center,
+        "a canister is collected from its collision box, not its picture",
+    )
+    for kind in ("normal", "moving", "fragile"):
+        platform = (
+            Platform(400, 300, (120, 20))
+            if kind == "normal"
+            else (BluePlatform(400, 300, (120, 20), 40.0) if kind == "moving" else RedPlatform(400, 300, (120, 20)))
+        )
+        check(
+            platform.image.get_size() == platform.rect.size == (120, 20),
+            f"a {kind} platform is drawn at exactly its collision size",
+        )
+
+
+def test_no_module_hardcodes_asset_paths() -> None:
+    section("Assets: no hard-coded paths in gameplay")
+    root = Path(__file__).resolve().parent.parent
+    for name in (
+        "core/world.py",
+        "entities/player.py",
+        "entities/meteorite.py",
+        "entities/fuel.py",
+        "entities/platforms.py",
+        "entities/powerup.py",
+        "entities/star.py",
+    ):
+        source = (root / name).read_text(encoding="utf-8")
+        check(
+            ".png" not in source
+            and ".otf" not in source
+            and "pygame.image.load" not in source,
+            f"{name} names no asset file and loads none itself",
+        )
+
+
+def test_no_disk_reads_in_the_frame_loop() -> None:
+    section("Assets: nothing is loaded while playing")
+    world = _bare_world()
+    script = ScriptedInput()
+    for _ in range(30):  # warm up: compose every clip the round can reach
+        world.update(FRAME, script)
+        world.player.teleport(world.player.rect.centerx, world.player.position_y - 60)
+    cached = world.resources.image_cache_size()
+    for _ in range(180):
+        world.update(FRAME, script)
+    check(
+        world.resources.image_cache_size() == cached,
+        f"180 frames of play load no new image ({cached} cached forms)",
+    )
+    check(
+        world.assets.player_frames("idle") is world.assets.player_frames("idle"),
+        "the round's clips come from the cache while it plays",
+    )
+
+
+class ScriptedInput:
+    """A stand-in for InputManager with no keys held."""
+
+    def get_movement_axis(self) -> int:  # noqa: D102
+        return 0
+
+
+def _painted(surface: pygame.Surface, rect: pygame.Rect, backdrop) -> int:
+    """Count on-screen pixels inside *rect* that differ from the backdrop."""
+    visible = rect.clip(surface.get_rect())
+    return sum(
+        1
+        for x in range(visible.left, visible.right, 3)
+        for y in range(visible.top, visible.bottom, 3)
+        if surface.get_at((x, y))[:3] != backdrop
+    )
+
+
+def test_what_reaches_the_screen() -> None:
+    section("Assets: what actually reaches the screen")
+    harness = Harness()
+    state = harness.start_round("paint")
+    world = state.world
+    assert world is not None
+    try:
+        harness.step(3)
+        surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        world.draw(surface)
+        backdrop = theme_spec(DEFAULT_THEME).bg_color
+
+        player_rect = world.player.blit_rect().move(
+            0, round(world.camera.offset_y)
+        )
+        check(
+            _painted(surface, player_rect, backdrop) > 40,
+            "the player is drawn where its collision box says it is",
+        )
+
+        pad = max(world.platforms, key=lambda platform: platform.rect.centery)
+        pad_rect = pad.blit_rect().move(0, round(world.camera.offset_y))
+        check(
+            surface.get_at((pad_rect.centerx, pad_rect.y + 1))[:3]
+            == PLATFORM_LOOKS[pad.look].highlight,
+            "a platform's lit top edge lands on the platform's own rectangle",
+        )
+        check(
+            _painted(surface, pad_rect, backdrop) > 50,
+            "the platform is drawn, not left as backdrop",
+        )
+
+        canister = next(iter(world.fuels))
+        canister_rect = canister.blit_rect().move(0, round(world.camera.offset_y))
+        check(
+            _painted(surface, canister_rect, backdrop) > 10,
+            "a canister is drawn distinct from the backdrop",
+        )
+
+        world.player.teleport(world.player.position_x, SCREEN_HEIGHT - 5000.0)
+        harness.step()
+        meteor: Meteorite | None = next(iter(world.meteorites), None)
+        check(meteor is not None, "a hazard exists to draw in a hazard stage")
+        if meteor is not None:
+            # Drop it into the middle of the view rather than waiting above it,
+            # so the check is about drawing and not about spawn timing.
+            meteor.wait = 0.0
+            meteor.position_x = SCREEN_WIDTH / 4
+            meteor.position_y = world.camera.to_world_y(200.0)
+            meteor._sync_rect()  # noqa: SLF001 - placing a sprite for a check
+            surface.fill(backdrop)
+            world.draw(surface)
+            check(
+                _painted(
+                    surface,
+                    meteor.blit_rect().move(0, round(world.camera.offset_y)),
+                    backdrop,
+                )
+                > 10,
+                "a hazard is drawn distinct from the backdrop",
+            )
+            check(
+                meteor.rect.size == METEORITE_SIZE,
+                "the drawn hazard is the size the player collides with",
+            )
+    finally:
+        harness.close()
+
+
+def test_art_report() -> None:
+    section("Assets: the art audit")
+    assets = AssetManager(ResourceManager())
+    assets.preload()
+    report = assets.art_report()
+    check(len(report) > 0, f"the manager reports how each asset resolved ({len(report)} names)")
+    borrowed = assets.borrowed_assets()
+    check(
+        all("art" not in line.split(" (")[1] for line in borrowed),
+        "borrowed assets are listed as placeholder work, not as art",
+    )
+    check(
+        assets.resolution_of("player.base.idle") == ART,
+        "the frames that ship are reported as art",
+    )
+
+
 def main() -> int:
     pygame.init()
     pygame.display.set_mode((1, 1))
@@ -1709,13 +2279,27 @@ def main() -> int:
     test_jump_buffer()
     test_stage_is_reported()
 
+    # Phase 4.5 - art direction, asset architecture and the visual pipeline.
+    test_asset_tree()
+    test_asset_manager()
+    test_asset_manager_never_crashes_without_art()
+    test_player_visual_architecture()
+    test_animation_is_frame_rate_independent()
+    test_art_never_moves_the_body()
+    test_no_module_hardcodes_asset_paths()
+    test_no_disk_reads_in_the_frame_loop()
+    test_what_reaches_the_screen()
+    test_art_report()
+
     print(f"\n{_checks - len(_failures)}/{_checks} checks passed")
     if _failures:
         print("Failures:")
         for failure in _failures:
             print(f"  - {failure}")
         return 1
-    print("All Phase 2, Phase 3 and Phase 4 regression checks passed.")
+    print(
+        "All Phase 2, Phase 3, Phase 4 and Phase 4.5 regression checks passed."
+    )
     return 0
 
 
