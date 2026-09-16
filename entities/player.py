@@ -4,6 +4,12 @@ The player keeps its position as a pair of floats in **world coordinates** and
 mirrors them into ``rect`` (which pygame can only express in integers) for
 collision and drawing.  Movement is integrated in real time, so the same jump
 is 225 px high and one second long at 30, 60 or 144 FPS.
+
+The player's *appearance* lives in :class:`~entities.player_visual.PlayerVisual`
+and the collision rectangle lives here, sized by
+:data:`~config.constants.PLAYER_COLLISION_SIZE`.  The two are connected in one
+direction only - the sprite is drawn against the rectangle - so swapping art,
+animating a state or adding a skin can never move the body the physics sees.
 """
 
 from __future__ import annotations
@@ -12,18 +18,26 @@ from typing import TYPE_CHECKING
 
 import pygame
 
+from config.asset_catalog import LANDING_HOLD
 from config.constants import (
     FUEL_MAX,
     FUEL_PICKUP_AMOUNT,
     FUEL_SCORE,
     JUMP_BUFFER_TIME,
     JUMP_SCORE,
+    PLAYER_COLLISION_SIZE,
     PLAYER_HAZARD_INSET,
     PLAYER_SPEED,
     SCREEN_HEIGHT,
     SCREEN_WIDTH,
 )
 from entities.platforms import Platform, RedPlatform
+from entities.player_visual import (
+    DEFAULT_SKIN,
+    PlayerSkin,
+    PlayerVisual,
+    PlayerVisualState,
+)
 from systems import physics
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
@@ -34,21 +48,73 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
 class Player(pygame.sprite.Sprite):
     """The player character controlled by keyboard input."""
 
-    def __init__(self, world: World) -> None:
+    def __init__(self, world: World, skin: PlayerSkin = DEFAULT_SKIN) -> None:
         super().__init__()
         self.world: World = world
-        self.original_img: pygame.Surface = world.player_img
-        self.image: pygame.Surface = self.original_img
-        self.flipped: bool = False
-        self.rect: pygame.Rect = self.image.get_rect(
-            center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
-        )
+        self.visual: PlayerVisual = PlayerVisual(world.assets, skin)
+        # The collision rectangle is declared independently of the art: the
+        # sprite is drawn against this rectangle, never the other way round.
+        self.rect: pygame.Rect = pygame.Rect((0, 0), PLAYER_COLLISION_SIZE)
+        self.rect.center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
         self.position_x: float = float(self.rect.x)
         self.position_y: float = float(self.rect.y)
         self.velocity_y: float = 0.0
         self.speed_x: float = PLAYER_SPEED
         self.on_ground: bool = False
         self.jump_buffer: float = 0.0
+        #: How long the Landing pose is still held; visual only, and it never
+        #: delays a buffered jump.
+        self.landing_hold: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Appearance
+    # ------------------------------------------------------------------
+
+    @property
+    def image(self) -> pygame.Surface:
+        """The frame to draw right now."""
+        return self.visual.frame
+
+    @property
+    def flipped(self) -> bool:
+        """Whether the sprite is mirrored (it faces the way it is moving)."""
+        return self.visual.flipped
+
+    @property
+    def visual_state(self) -> PlayerVisualState:
+        """Translate the physics into the pose the player is drawn in.
+
+        Gameplay decides *what is happening*; this decides *what that looks
+        like*.  Keeping the translation in one place is what stops rendering
+        logic from leaking into the simulation - and what lets Landing, Hurt
+        and Death exist as poses before their art does.
+        """
+        if self.world.is_over:
+            return PlayerVisualState.DEATH
+        if self.on_ground:
+            return (
+                PlayerVisualState.LANDING
+                if self.landing_hold > 0.0
+                else PlayerVisualState.IDLE
+            )
+        if self.velocity_y < 0:
+            return PlayerVisualState.JUMP
+        return PlayerVisualState.FALL
+
+    def blit_rect(self) -> pygame.Rect:
+        """Return where the sprite is drawn in world coordinates."""
+        return self.visual.blit_rect(self.rect)
+
+    def on_death(self) -> None:
+        """Note that the round ended.  Appearance only: no physics change."""
+        self.visual.set_state(PlayerVisualState.DEATH)
+
+    def _update_visual(self, dt: float) -> None:
+        """Advance the pose: timers first, then the clip by elapsed time."""
+        if self.landing_hold > 0.0:
+            self.landing_hold = max(0.0, self.landing_hold - dt)
+        self.visual.set_state(self.visual_state)
+        self.visual.update(dt)
 
     @property
     def hazard_hitbox(self) -> pygame.Rect:
@@ -70,6 +136,7 @@ class Player(pygame.sprite.Sprite):
         self.position_y = y
         self.velocity_y = 0.0
         self.on_ground = False
+        self.landing_hold = 0.0
         self.sync_rect()
 
     def sync_rect(self) -> None:
@@ -137,6 +204,7 @@ class Player(pygame.sprite.Sprite):
 
         self._collect_fuel()
         self._check_hazards()
+        self._update_visual(dt)
 
     def _consume_jump_buffer(self, dt: float) -> None:
         """Fire a buffered jump request once there is ground under the player."""
@@ -155,13 +223,13 @@ class Player(pygame.sprite.Sprite):
         self.rect.x = round(self.position_x)
 
     def _face(self, axis: int) -> None:
-        """Mirror the sprite so the player faces the direction of travel."""
-        if axis < 0 and not self.flipped:
-            self.image = pygame.transform.flip(self.original_img, True, False)
-            self.flipped = True
-        elif axis > 0 and self.flipped:
-            self.image = self.original_img
-            self.flipped = False
+        """Face the sprite the way the player is travelling.
+
+        The mirrored frames are composed once by the asset manager and handed
+        out from its cache, so turning around never transforms an image inside
+        the frame loop.
+        """
+        self.visual.set_facing(axis)
 
     def _apply_gravity(self, dt: float) -> None:
         """Integrate one gravity step in world coordinates."""
@@ -203,6 +271,7 @@ class Player(pygame.sprite.Sprite):
         self.rect.y = round(self.position_y)
         self.velocity_y = 0.0
         self.on_ground = True
+        self.landing_hold = LANDING_HOLD
         if isinstance(landing, RedPlatform):
             landing.start_timer()
 
